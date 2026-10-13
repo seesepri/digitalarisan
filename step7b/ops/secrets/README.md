@@ -11,4 +11,4 @@ Create these files on the deployment host (mode 0600) or replace the Compose sec
 - twilio_auth_token (SMS verification only; Twilio Verify service SID is configuration, not an auth token)
 - postgres_password (only for the optional self-managed PostgreSQL profile)
 
-Never commit secret values. `BANK_PII_ENCRYPTION_KEY` must never be derived from or replaced by `AUTH_SECRET` in production. Rotate by provisioning a new secret, deploying, verifying, then revoking the old credential.
+Never commit secret values. `BANK_PII_ENCRYPTION_KEY` must never be derived from or replaced by `AUTH_SECRET` in production. Rotate API/auth credentials through a separately tested revoke/rollover procedure. **Do not apply that procedure blindly to BANK_PII_ENCRYPTION_KEY**: current `enc:v1` ciphertext has no key ID/keyring. Replacing the key alone makes historical records/backups unreadable. Bank-key rotation is BLOCKED until versioned decryption, re-encryption, preserved original backups/keys and restore tests are implemented. Never revoke the old bank key while any historical ciphertext/retained backup needs it.

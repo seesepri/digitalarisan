@@ -1,14 +1,14 @@
 import { createHash } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { auditLogs, notifications, paymentWebhookEvents, topups, walletTransactions, wallets } from "@/db/schema";
-import { enforceRateLimit, errorResponse, jsonOk, getRequestMetadata, ApiError } from "@/server/http";
+import { enforceRateLimit, errorResponse, jsonOk, getRequestMetadata, readLimitedText, ApiError } from "@/server/http";
 import { getPaymentProvider } from "@/server/services/payment-provider";
 
 export async function POST(request: Request) {
   try {
     await enforceRateLimit(request, "payment-webhook", 120, 60_000);
-    const rawBody = await request.text();
+    const rawBody = await readLimitedText(request, 32_000);
     if (rawBody.length > 32_000) throw new ApiError("Payload webhook terlalu besar.", "PAYLOAD_TOO_LARGE", 413);
     const provider = getPaymentProvider();
     const event = provider.verifyWebhook({
@@ -20,8 +20,12 @@ export async function POST(request: Request) {
     const payloadHash = createHash("sha256").update(rawBody).digest("hex");
 
     const result = await db.transaction(async (tx) => {
-      await tx.execute(sql`SELECT id FROM topups WHERE provider_reference = ${event.reference} FOR UPDATE`);
-      const [topup] = await tx.select().from(topups).where(eq(topups.providerReference, event.reference)).limit(1);
+      const isUuidReference = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(event.reference);
+      const candidates = await tx.select().from(topups).where(and(eq(topups.provider, event.provider), or(
+        eq(topups.providerReference, event.reference), isUuidReference ? eq(topups.id, event.reference) : sql`false`,
+      ))).for("update").limit(2);
+      if (candidates.length > 1) throw new ApiError("Reference webhook ambigu.", "PAYMENT_REFERENCE_AMBIGUOUS", 409);
+      const [topup] = candidates;
       if (!topup) throw new ApiError("Top-up tidak ditemukan.", "TOPUP_NOT_FOUND", 404);
       if (topup.provider !== event.provider || topup.amount !== event.amount || event.currency !== "IDR") {
         throw new ApiError("Nominal, currency, atau provider tidak cocok dengan intent top-up.", "PAYMENT_MISMATCH", 409);

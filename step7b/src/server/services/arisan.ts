@@ -25,6 +25,12 @@ import { ApiError } from "@/server/http";
 
 type RequestMeta = { ipAddress?: string | null; userAgent?: string | null };
 
+type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+async function assertJoinReplay(tx: Transaction, previous: typeof walletTransactions.$inferSelect, input: { userId: string; periodId: string }) {
+  const [participant] = previous.referenceId ? await tx.select({ periodId: arisanParticipants.periodId }).from(arisanParticipants).where(eq(arisanParticipants.id, previous.referenceId)).limit(1) : [];
+  if (previous.userId !== input.userId || previous.type !== "JOIN_ARISAN" || previous.referenceType !== "arisan_participant" || participant?.periodId !== input.periodId) throw new ApiError("Idempotency key telah digunakan untuk operasi/periode lain.", "IDEMPOTENCY_CONFLICT", 409);
+}
+
 export async function joinPeriod(input: {
   periodId: string;
   userId: string;
@@ -38,18 +44,14 @@ export async function joinPeriod(input: {
       .where(eq(walletTransactions.idempotencyKey, input.idempotencyKey))
       .limit(1);
     if (previous) {
-      if (previous.userId !== input.userId || previous.type !== "JOIN_ARISAN") {
-        throw new ApiError("Idempotency key telah digunakan untuk operasi lain.", "IDEMPOTENCY_CONFLICT", 409);
-      }
+      await assertJoinReplay(tx, previous, input);
       return { participantId: previous.referenceId, replayed: true };
     }
 
     await tx.execute(sql`SELECT id FROM arisan_periods WHERE id = ${input.periodId} FOR UPDATE`);
     const [afterLock] = await tx.select().from(walletTransactions).where(eq(walletTransactions.idempotencyKey, input.idempotencyKey)).limit(1);
     if (afterLock) {
-      if (afterLock.userId !== input.userId || afterLock.type !== "JOIN_ARISAN") {
-        throw new ApiError("Idempotency key telah digunakan untuk operasi lain.", "IDEMPOTENCY_CONFLICT", 409);
-      }
+      await assertJoinReplay(tx, afterLock, input);
       return { participantId: afterLock.referenceId, replayed: true };
     }
     const [period] = await tx.select().from(arisanPeriods).where(eq(arisanPeriods.id, input.periodId)).limit(1);
@@ -84,6 +86,8 @@ export async function joinPeriod(input: {
     }
 
     await tx.execute(sql`SELECT id FROM wallets WHERE user_id = ${input.userId} FOR UPDATE`);
+    const [afterWalletLock] = await tx.select().from(walletTransactions).where(eq(walletTransactions.idempotencyKey, input.idempotencyKey)).limit(1);
+    if (afterWalletLock) { await assertJoinReplay(tx, afterWalletLock, input); return { participantId: afterWalletLock.referenceId, replayed: true }; }
     const [wallet] = await tx.select().from(wallets).where(eq(wallets.userId, input.userId)).limit(1);
     if (!wallet) throw new ApiError("Wallet pengguna tidak ditemukan.", "WALLET_NOT_FOUND", 404);
     if (wallet.availableBalance < period.contributionAmount) {
@@ -189,7 +193,7 @@ export async function cancelParticipation(input: {
       .where(eq(walletTransactions.idempotencyKey, input.idempotencyKey))
       .limit(1);
     if (previous) {
-      if (previous.userId !== input.userId || previous.type !== "CANCEL_ARISAN") {
+      if (previous.userId !== input.userId || previous.type !== "CANCEL_ARISAN" || previous.referenceId !== input.participantId) {
         throw new ApiError("Idempotency key telah digunakan untuk operasi lain.", "IDEMPOTENCY_CONFLICT", 409);
       }
       return { participantId: previous.referenceId, refunded: true, replayed: true };

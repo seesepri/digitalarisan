@@ -15,6 +15,34 @@
       "when": 1791631988000,
       "tag": "0001_phone_only_registration",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791889757849,
+      "tag": "0002_withdrawal_provider_evidence",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791889757850,
+      "tag": "0003_ledger_integrity_and_safe_money",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1791889757851,
+      "tag": "0004_wallet_reservation_invariants",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1791890604513,
+      "tag": "0005_session_rotation_safety",
+      "breakpoints": true
     }
   ]
 }

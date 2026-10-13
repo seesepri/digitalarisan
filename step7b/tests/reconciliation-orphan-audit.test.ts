@@ -28,11 +28,21 @@ test("reconciliation audit covers all requested P0 conditions", () => {
 test("provider SUCCESS reconciliation uses the idempotent provider finalizer", () => {
   const reconciliation = fs.readFileSync(path.resolve(process.cwd(), "src/server/services/reconciliation.ts"), "utf8");
   const withdrawal = fs.readFileSync(path.resolve(process.cwd(), "src/server/services/payout-withdrawal.ts"), "utf8");
-  assert.match(reconciliation, /processWithdrawal\(\{[\s\S]*decision: "SUCCESS"[\s\S]*source: "PROVIDER"[\s\S]*providerReference:/);
+  assert.match(reconciliation, /processWithdrawal\(\{[\s\S]*decision: "SUCCESS"[\s\S]*source: "PROVIDER"[\s\S]*providerEvidence:/);
   assert.match(reconciliation, /adminRole: "SYSTEM"/);
   assert.match(reconciliation, /replayed \? "ALREADY_FINALIZED" : "FINALIZED"/);
   assert.match(withdrawal, /SELECT id FROM withdrawals WHERE id = \$\{input\.withdrawalId\} FOR UPDATE/);
-  assert.match(withdrawal, /if \(withdrawal\.status === input\.decision\) \{[\s\S]*replayed: true/);
+  assert.match(withdrawal, /if \(withdrawal\.status === input\.decision\)[\s\S]*replayed: true/);
   assert.match(withdrawal, /referenceType: "withdrawal", referenceId: withdrawal\.id/);
   assert.match(withdrawal, /source === "PROVIDER"/);
+});
+
+
+test("accounting audit does not silently mutate money and provider queries always use the business reference", () => {
+  const source = fs.readFileSync(path.resolve(process.cwd(), "src/server/services/reconciliation.ts"), "utf8");
+  assert.match(source, /if \(!scope\.recoverProviderSuccess\)/);
+  assert.match(source, /recovery: "NOT_REQUESTED"/);
+  assert.match(source, /role !== "SUPER_ADMIN"/);
+  assert.doesNotMatch(source, /providerReference \|\| stablePayoutReference/);
+  assert.match(source, /expectedAttemptCount: withdrawal\.attemptCount/);
 });

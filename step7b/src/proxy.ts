@@ -13,7 +13,7 @@ function ensureTraceParent(value: string | null): string {
   return `00-${randomHex(16)}-${randomHex(8)}-01`;
 }
 
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   const started = Date.now();
   const requestId = request.headers.get("x-request-id") || crypto.randomUUID();
   const traceparent = ensureTraceParent(request.headers.get("traceparent"));

@@ -67,9 +67,12 @@ export async function requireKycVerified(userId: string) {
 
 export async function approveWithdrawal(input: { withdrawalId: string; adminId: string; reason?: string | null; ipAddress?: string | null; userAgent?: string | null }) {
   return db.transaction(async (tx) => {
+    const [admin] = await tx.select({ role: users.role, status: users.status }).from(users).where(eq(users.id, input.adminId)).limit(1);
+    if (!admin || admin.status !== "ACTIVE" || !["ADMIN", "SUPER_ADMIN"].includes(admin.role)) throw new ApiError("Akses administrator aktif diperlukan.", "FORBIDDEN", 403);
     await tx.execute(sql`SELECT id FROM withdrawals WHERE id = ${input.withdrawalId} FOR UPDATE`);
     const [withdrawal] = await tx.select().from(withdrawals).where(eq(withdrawals.id, input.withdrawalId)).limit(1);
     if (!withdrawal) throw new ApiError("Withdrawal tidak ditemukan.", "WITHDRAWAL_NOT_FOUND", 404);
+    if (withdrawal.userId === input.adminId) throw new ApiError("Administrator tidak boleh meng-approve withdrawal miliknya sendiri.", "WITHDRAWAL_SELF_APPROVAL_BLOCKED", 403);
     if (withdrawal.approvalStatus === "APPROVED") return { withdrawal: financialWithdrawalView(withdrawal), replayed: true };
     if (withdrawal.status !== "PENDING" && withdrawal.status !== "FAILED_RETRYABLE") throw new ApiError("Withdrawal tidak berada pada state yang dapat di-approve.", "WITHDRAWAL_APPROVAL_INVALID", 409);
     if (withdrawal.riskStatus === "BLOCKED") throw new ApiError("Withdrawal diblokir oleh kontrol risiko.", "WITHDRAWAL_RISK_BLOCKED", 409);

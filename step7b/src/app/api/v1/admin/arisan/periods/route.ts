@@ -1,7 +1,7 @@
 import { eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { arisanParticipants, arisanPeriods, arisanTypes, auditLogs } from "@/db/schema";
-import { ApiError, assertSameOrigin, errorResponse, getRequestMetadata, jsonOk, readJson, requireAdmin, requireSuperAdmin, requiredString } from "@/server/http";
+import { enforceRateLimit, ApiError, assertSameOrigin, errorResponse, getRequestMetadata, jsonOk, readJson, requireAdmin, requireSuperAdmin, requiredString } from "@/server/http";
 
 function parseDate(value: unknown, field: string): Date {
   if (typeof value !== "string" || value.length > 80) throw new ApiError(`${field} tidak valid.`, "VALIDATION_ERROR", 400);
@@ -55,6 +55,7 @@ export async function POST(request: Request) {
   try {
     assertSameOrigin(request);
     const admin = await requireSuperAdmin(request);
+    await enforceRateLimit(request, "admin-arisan-periods", 10, 60_000, admin.id);
     const body = await readJson(request);
     const typeId = requiredString(body.typeId, "Jenis arisan", 36, 36);
     const code = requiredString(body.code, "Kode periode", 5, 64).toUpperCase();

@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import { createHash, createHmac } from "node:crypto";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { db } from "@/db";
@@ -46,13 +47,42 @@ export function errorResponse(error: unknown): Response {
   if (error && typeof error === "object" && "code" in error && "status" in error && typeof (error as { code?: unknown }).code === "string" && typeof (error as { status?: unknown }).status === "number") {
     return jsonError(error instanceof Error ? error.message : "Service temporarily unavailable.", String((error as { code: string }).code), Number((error as { status: number }).status));
   }
+  const cause = error instanceof Error && error.cause && typeof error.cause === "object" ? error.cause as { code?: unknown } : null;
+  const databaseCode = typeof cause?.code === "string" ? cause.code : null;
+  // Drizzle's wrapper message/stack contains SQL parameters (PII/password/token hashes): never log it.
+  if (databaseCode) {
+    log("ERROR", "database_operation_failed", { databaseCode, errorType: error instanceof Error ? error.name : "Unknown" });
+    if (databaseCode === "23505") return jsonError("Operasi bertentangan dengan data/idempotency yang sudah tercatat.", "IDEMPOTENCY_CONFLICT", 409);
+    return jsonError("Operasi database ditolak atau tidak dapat diselesaikan.", "DATABASE_OPERATION_FAILED", 500);
+  }
   log("ERROR", "unhandled_api_error", { error });
   return jsonError("Terjadi kesalahan pada server.", "INTERNAL_ERROR", 500);
 }
 
+export async function readLimitedText(request: Request, maximumBytes = 64_000): Promise<string> {
+  const length = request.headers.get("content-length");
+  if (length && Number(length) > maximumBytes) throw new ApiError("Payload terlalu besar.", "PAYLOAD_TOO_LARGE", 413);
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maximumBytes) { await reader.cancel(); throw new ApiError("Payload terlalu besar.", "PAYLOAD_TOO_LARGE", 413); }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  const data = new Uint8Array(bytes); let offset = 0;
+  for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.byteLength; }
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(data); } catch { throw new ApiError("Encoding body tidak valid.", "INVALID_BODY", 400); }
+}
+
 export async function readJson(request: Request): Promise<Record<string, unknown>> {
   try {
-    const value: unknown = await request.json();
+    const value: unknown = JSON.parse(await readLimitedText(request));
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
       throw new ApiError("Format request tidak valid.", "INVALID_BODY", 400);
     }
@@ -125,19 +155,25 @@ export function assertSameOrigin(request: Request): void {
   }
   let originUrl: URL;
   try { originUrl = new URL(origin); } catch { throw new ApiError("Origin tidak valid.", "CSRF_REJECTED", 403); }
-  const allowed = new Set<string>([new URL(request.url).origin]);
+  const allowed = new Set<string>(process.env.NODE_ENV === "production" ? [] : [new URL(request.url).origin]);
+  if (process.env.NODE_ENV === "production" && !process.env.APP_URL) throw new ApiError("APP_URL wajib di production.", "SERVER_CONFIGURATION_ERROR", 500);
   if (process.env.APP_URL) {
-    try { allowed.add(new URL(process.env.APP_URL).origin); } catch { throw new ApiError("APP_URL tidak valid.", "SERVER_CONFIGURATION_ERROR", 500); }
+    try { const appUrl = new URL(process.env.APP_URL); if (process.env.NODE_ENV === "production" && appUrl.protocol !== "https:") throw new Error("HTTPS required"); allowed.add(appUrl.origin); } catch { throw new ApiError("APP_URL tidak valid.", "SERVER_CONFIGURATION_ERROR", 500); }
   }
   if (!allowed.has(originUrl.origin)) throw new ApiError("Origin permintaan tidak diizinkan.", "CSRF_REJECTED", 403);
 }
 
-function clientIdentity(request: Request): string {
-  if (process.env.TRUST_PROXY !== "true") return "direct";
-  const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  const real = request.headers.get("x-real-ip")?.trim();
-  return (forwarded || real || "unknown").slice(0, 120);
+function trustedProxyIp(request: Request): string | null {
+  if (process.env.TRUST_PROXY !== "true") return null;
+  const hops = Number(process.env.TRUST_PROXY_HOPS ?? "1");
+  if (!Number.isInteger(hops) || hops < 1 || hops > 10) throw new ApiError("TRUST_PROXY_HOPS tidak valid.", "SERVER_CONFIGURATION_ERROR", 500);
+  const values = (request.headers.get("x-forwarded-for") ?? "").split(",").map((value) => value.trim());
+  // Count from the trusted-proxy side (right), never an attacker-prepended first value.
+  const value = values.length >= hops ? values[values.length - hops] : null;
+  return value && isIP(value) ? value : null;
 }
+
+function clientIdentity(request: Request): string { return trustedProxyIp(request) ?? "direct"; }
 
 export async function enforceRateLimit(request: Request, action: string, maximum = 12, windowMs = 60_000, subject?: string): Promise<void> {
   if (!Number.isSafeInteger(maximum) || maximum <= 0 || !Number.isSafeInteger(windowMs) || windowMs < 1000) {
@@ -148,7 +184,7 @@ export async function enforceRateLimit(request: Request, action: string, maximum
   }
   const identity = clientIdentity(request);
   const subjectKey = subject ? createHmac("sha256", process.env.AUTH_SECRET ?? "development-rate-limit-key").update(subject).digest("hex") : "";
-  const key = `${action}:${identity}:${subjectKey}`;
+  const key = subject ? `${action}:subject:${subjectKey}` : `${action}:ip:${identity}`;
   const now = new Date();
   const expiresAt = new Date(now.getTime() + windowMs);
   const result = await db.execute(sql`
@@ -170,9 +206,7 @@ export async function enforceRateLimit(request: Request, action: string, maximum
 }
 
 export function getRequestMetadata(request: Request): { ipAddress: string | null; userAgent: string | null } {
-  const ipAddress = process.env.TRUST_PROXY === "true"
-    ? (request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || request.headers.get("x-real-ip") || null)
-    : null;
+  const ipAddress = trustedProxyIp(request);
   return { ipAddress: ipAddress?.slice(0, 64) ?? null, userAgent: request.headers.get("user-agent")?.slice(0, 1000) ?? null };
 }
 

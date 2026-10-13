@@ -1,12 +1,12 @@
-﻿import { after, before, describe, test } from "node:test";
+﻿import { after, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 
-const enabled = Boolean(process.env.TEST_DATABASE_URL || process.env.DATABASE_URL);
-const testDbUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
-if (testDbUrl) process.env.DATABASE_URL = testDbUrl;
+const { configureTestDatabase } = await import("../scripts/test-database-guard.mjs");
+const testDbUrl = await configureTestDatabase();
+const enabled = Boolean(testDbUrl);
 
 let db: typeof import("@/db").db;
 let pool: typeof import("@/db").pool;
@@ -24,6 +24,7 @@ if (enabled) {
 }
 
 const maybeDescribe = enabled ? describe : describe.skip;
+beforeEach(() => { providerCreateCount = 0; providerStatusCount = 0; providerReferences.clear(); });
 const createdUsers: string[] = [];
 const createdWallets: string[] = [];
 const createdWithdrawalIds: string[] = [];
@@ -45,6 +46,7 @@ async function createUserWithWallet(balance = 100_000, role: "USER" | "ADMIN" = 
     status: "ACTIVE",
     kycStatus: "VERIFIED",
     kycVerifiedAt: new Date(),
+    kycReviewedBy: userId,
   });
   await db.insert(schema.wallets).values({ id: walletId, userId, availableBalance: balance });
   createdUsers.push(userId);
@@ -66,7 +68,7 @@ let providerServer: Server | null = null;
 let providerBaseUrl = "";
 let providerCreateCount = 0;
 let providerStatusCount = 0;
-const providerReferences = new Set<string>();
+const providerReferences = new Map<string, number>();
 
 async function startFakePayoutProvider() {
   providerCreateCount = 0;
@@ -80,10 +82,9 @@ async function startFakePayoutProvider() {
     const reference = req.headers["idempotency-key"]?.toString() || body.reference;
 
     if (req.method === "POST" && req.url === "/disbursements") {
-      providerCreateCount += 1;
-      providerReferences.add(reference);
+      if (!providerReferences.has(reference)) { providerCreateCount += 1; providerReferences.set(reference, body.amount); }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ providerReference: `PROV-${reference}`, status: "SUCCESS" }));
+      res.end(JSON.stringify({ reference, providerReference: `PROV-${reference}`, amount: providerReferences.get(reference), currency: "IDR", status: "SUCCESS" }));
       return;
     }
 
@@ -92,7 +93,7 @@ async function startFakePayoutProvider() {
       const urlReference = decodeURIComponent(req.url.slice("/disbursements/".length));
       assert.ok(providerReferences.has(urlReference), `provider status requested for unknown reference ${urlReference}`);
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ providerReference: `PROV-${urlReference}`, status: "SUCCESS" }));
+      res.end(JSON.stringify({ reference: urlReference, providerReference: `PROV-${urlReference}`, amount: providerReferences.get(urlReference), currency: "IDR", status: "SUCCESS" }));
       return;
     }
 
@@ -205,7 +206,7 @@ maybeDescribe("crash/restart recovery", () => {
       amount: 25_000,
       bankName: "TEST BANK",
       accountName: "Crash Recovery",
-      accountNumber: "CRASH-LOCK",
+      accountNumber: "1234567890",
       idempotencyKey,
     });
     createdWithdrawalIds.push(created.withdrawal.id);
@@ -215,7 +216,7 @@ maybeDescribe("crash/restart recovery", () => {
       amount: 25_000,
       bankName: "TEST BANK",
       accountName: "Crash Recovery",
-      accountNumber: "CRASH-LOCK",
+      accountNumber: "1234567890",
       idempotencyKey,
     });
     assert.equal(replay.replayed, true);
@@ -230,18 +231,21 @@ maybeDescribe("crash/restart recovery", () => {
 
   test("provider SUCCESS followed by simulated process death finalizes exactly once after restart", async () => {
     const user = await createUserWithWallet(100_000);
+    const maker = await createUserWithWallet(0, "ADMIN");
     const admin = await createUserWithWallet(0, "ADMIN");
     const created = await createWithdrawal({
       userId: user.userId,
       amount: 30_000,
       bankName: "TEST BANK",
       accountName: "Crash Recovery",
-      accountNumber: "CRASH-PROVIDER",
+      accountNumber: "1234567890",
       idempotencyKey: `CRASH-PROVIDER-${randomUUID()}`,
     });
     createdWithdrawalIds.push(created.withdrawal.id);
-    await approveWithdrawal(created.withdrawal.id, admin.userId);
+    await approveWithdrawal(created.withdrawal.id, maker.userId);
 
+    const { processWithdrawal } = await import("@/server/services/payout-withdrawal");
+    await processWithdrawal({ withdrawalId: created.withdrawal.id, decision: "PROCESSING", adminId: admin.userId, adminRole: "ADMIN" });
     const reference = stablePayoutReference(created.withdrawal.id);
     const { HttpPayoutProvider } = await import("@/server/services/payout-provider");
     const provider = new HttpPayoutProvider(process.env.PAYOUT_PROVIDER!);
@@ -259,14 +263,14 @@ maybeDescribe("crash/restart recovery", () => {
     // process dies before processWithdrawal() can commit the local accounting.
     // Restart is represented by a fresh executeWithdrawal() call.
     const [beforeRestart] = await db.select().from(schema.withdrawals).where(eq(schema.withdrawals.id, created.withdrawal.id));
-    assert.equal(beforeRestart.status, "PENDING");
+    assert.equal(beforeRestart.status, "PROCESSING");
     const [walletBeforeRestart] = await db.select().from(schema.wallets).where(eq(schema.wallets.id, user.walletId));
     assert.equal(walletBeforeRestart.pendingBalance, 30_000);
 
     const recovered = await executeWithdrawal({ withdrawalId: created.withdrawal.id, adminId: admin.userId, adminRole: "ADMIN" });
     assert.equal(recovered.status, "SUCCESS");
     assert.equal(providerCreateCount, 1, "restart must not create a second provider payout");
-    assert.equal(providerStatusCount, 0, "PENDING restart performs the already-idempotent create path once; no status race is needed");
+    assert.equal(providerStatusCount, 1, "restart must inquire using the stable request reference");
 
     const replay = await executeWithdrawal({ withdrawalId: created.withdrawal.id, adminId: admin.userId, adminRole: "ADMIN" });
     assert.equal(replay.status, "SUCCESS");
@@ -279,30 +283,31 @@ maybeDescribe("crash/restart recovery", () => {
     assert.equal(walletAfter.lockedBalance, 0);
 
     const ledgerRows = await db.select().from(schema.walletTransactions).where(and(eq(schema.walletTransactions.walletId, user.walletId), eq(schema.walletTransactions.referenceId, created.withdrawal.id)));
-    assert.equal(ledgerRows.length, 1, "local wallet debit must be committed exactly once");
+    assert.equal(ledgerRows.length, 2, "one reservation entry and one terminal debit, never a duplicate");
     assert.equal(ledgerRows[0].type, "WITHDRAW");
     assert.equal(ledgerRows[0].amount, 30_000);
   });
 
   test("crash before local DB commit after provider SUCCESS is recovered by provider-status query without double debit", async () => {
     const user = await createUserWithWallet(100_000);
+    const maker = await createUserWithWallet(0, "ADMIN");
     const admin = await createUserWithWallet(0, "ADMIN");
     const created = await createWithdrawal({
       userId: user.userId,
       amount: 20_000,
       bankName: "TEST BANK",
       accountName: "Crash Recovery",
-      accountNumber: "CRASH-STATUS",
+      accountNumber: "1234567890",
       idempotencyKey: `CRASH-STATUS-${randomUUID()}`,
     });
     createdWithdrawalIds.push(created.withdrawal.id);
-    await approveWithdrawal(created.withdrawal.id, admin.userId);
+    await approveWithdrawal(created.withdrawal.id, maker.userId);
 
     // Commit PROCESSING first, then the external provider succeeds. The process
     // dies before the local SUCCESS transaction; restart must reconcile by status.
     await db.transaction(async (tx) => {
       await tx.execute(sql`SELECT id FROM withdrawals WHERE id = ${created.withdrawal.id} FOR UPDATE`);
-      await tx.update(schema.withdrawals).set({ status: "PROCESSING", attemptCount: 1, updatedAt: new Date() }).where(eq(schema.withdrawals.id, created.withdrawal.id));
+      await tx.update(schema.withdrawals).set({ provider: process.env.PAYOUT_PROVIDER!, status: "PROCESSING", attemptCount: 1, updatedAt: new Date() }).where(eq(schema.withdrawals.id, created.withdrawal.id));
       await tx.insert(schema.withdrawalAttempts).values({
         withdrawalId: created.withdrawal.id,
         attemptNumber: 1,
@@ -336,7 +341,7 @@ maybeDescribe("crash/restart recovery", () => {
     assert.equal(wallet.availableBalance, 80_000);
     assert.equal(wallet.pendingBalance, 0);
     const ledgerRows = await db.select().from(schema.walletTransactions).where(and(eq(schema.walletTransactions.walletId, user.walletId), eq(schema.walletTransactions.referenceId, created.withdrawal.id)));
-    assert.equal(ledgerRows.length, 1);
+    assert.equal(ledgerRows.length, 2);
   });
 
   test("rollback before settlement commit leaves no partial accounting state", async () => {
@@ -361,8 +366,8 @@ maybeDescribe("crash/restart recovery", () => {
       code: `CRASH-${periodId.slice(0, 12)}`,
       registrationStartsAt: new Date(now - 120_000),
       registrationEndsAt: new Date(now + 120_000),
-      drawingAt: new Date(now + 120_000),
-      cancellationDeadlineAt: new Date(now + 120_000),
+      drawingAt: new Date(now + 240_000),
+      cancellationDeadlineAt: new Date(now + 180_000),
       minimumParticipants: 2,
       maximumParticipants: 2,
       contributionAmount: 25_000,

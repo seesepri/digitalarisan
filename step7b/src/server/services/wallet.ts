@@ -1,10 +1,10 @@
-import { encryptBankPii, safeWithdrawalView } from "@/server/services/pii";
+import { decryptBankPii, encryptBankPii, safeWithdrawalView } from "@/server/services/pii";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { cursorWhere, decodeCursor, encodeCursor, parsePageSize } from "@/server/pagination";
 import { auditLogs, notifications, topups, users, walletTransactions, wallets, withdrawals } from "@/db/schema";
-import { ApiError } from "@/server/http";
+import { ApiError, positiveInteger } from "@/server/http";
 import { getPaymentProvider } from "@/server/services/payment-provider";
 import { assessWithdrawalRisk } from "@/server/services/compliance";
 
@@ -17,14 +17,16 @@ export async function createTopup(input: {
   callbackUrl: string;
   meta?: RequestMeta;
 }) {
+  positiveInteger(input.amount, "Nominal top-up", 50_000_000);
   const provider = getPaymentProvider();
   const createdResult = await db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT id FROM wallets WHERE user_id = ${input.userId} FOR UPDATE`);
     const [wallet] = await tx.select().from(wallets).where(eq(wallets.userId, input.userId)).limit(1);
     if (!wallet) throw new ApiError("Wallet pengguna tidak ditemukan.", "WALLET_NOT_FOUND", 404);
 
     const [previous] = await tx.select().from(topups).where(eq(topups.idempotencyKey, input.idempotencyKey)).limit(1);
     if (previous) {
-      if (previous.userId !== input.userId || previous.amount !== input.amount) {
+      if (previous.userId !== input.userId || previous.amount !== input.amount || previous.provider !== provider.name) {
         throw new ApiError("Idempotency key telah digunakan untuk intent top-up lain.", "IDEMPOTENCY_CONFLICT", 409);
       }
       return { topup: previous, replayed: true };
@@ -51,19 +53,10 @@ export async function createTopup(input: {
   });
 
   if (createdResult.replayed) {
-    if ((createdResult.topup.status === "PENDING" || createdResult.topup.status === "PROCESSING") && createdResult.topup.checkoutUrl) {
-      return { topup: createdResult.topup, replayed: true };
-    }
-    if (createdResult.topup.status === "SUCCESS" || createdResult.topup.status === "FAILED" || createdResult.topup.status === "EXPIRED") {
-      return { topup: createdResult.topup, replayed: true };
-    }
-    if (!createdResult.topup.checkoutUrl && provider.getPaymentStatus) {
-      try {
-        const status = await provider.getPaymentStatus(createdResult.topup.providerReference ?? createdResult.topup.id);
-        if (status.status !== "PROCESSING") return reconcileTopupPayment({ topupId: createdResult.topup.id, meta: input.meta });
-        return { topup: createdResult.topup, replayed: true };
-      } catch { /* fall through to provider create only when status inquiry cannot resolve the intent */ }
-    }
+    if (createdResult.topup.checkoutUrl || createdResult.topup.status === "SUCCESS") return { topup: createdResult.topup, replayed: true };
+    // Lost/ambiguous create response: inquire, never blindly create another charge.
+    if (!provider.getPaymentStatus) throw new ApiError("Intent top-up perlu rekonsiliasi provider, bukan create ulang.", "TOPUP_RECONCILIATION_REQUIRED", 409);
+    return reconcileTopupPayment({ topupId: createdResult.topup.id, meta: input.meta });
   }
 
   try {
@@ -98,6 +91,13 @@ export async function createTopup(input: {
   }
 }
 
+function sameWithdrawalIntent(previous: typeof withdrawals.$inferSelect, input: { userId: string; amount: number; bankName: string; accountName: string; accountNumber: string }) {
+  return previous.userId === input.userId && previous.amount === input.amount
+    && decryptBankPii(previous.bankName).trim() === input.bankName.trim()
+    && decryptBankPii(previous.accountName).trim() === input.accountName.trim()
+    && decryptBankPii(previous.accountNumber).trim() === input.accountNumber.trim();
+}
+
 export async function createWithdrawal(input: {
   userId: string;
   amount: number;
@@ -107,22 +107,26 @@ export async function createWithdrawal(input: {
   idempotencyKey: string;
   meta?: RequestMeta;
 }) {
+  positiveInteger(input.amount, "Nominal withdrawal", 50_000_000);
+  if ([input.bankName, input.accountName, input.accountNumber].some((value) => /^enc:/i.test(value.trim()) || /[\u0000-\u001f\u007f]/.test(value))) throw new ApiError("Data rekening harus berupa teks biasa yang valid, bukan ciphertext/control characters.", "VALIDATION_ERROR", 400);
+  if (!/^\d{6,32}$/.test(input.accountNumber.trim()) || !input.bankName.trim() || !input.accountName.trim()) throw new ApiError("Rekening withdrawal tidak valid.", "VALIDATION_ERROR", 400);
   return db.transaction(async (tx) => {
     const [previous] = await tx.select().from(withdrawals).where(eq(withdrawals.idempotencyKey, input.idempotencyKey)).limit(1);
     if (previous) {
-      if (previous.userId !== input.userId || previous.amount !== input.amount) {
+      if (!sameWithdrawalIntent(previous, input)) {
         throw new ApiError("Idempotency key telah digunakan untuk withdrawal lain.", "IDEMPOTENCY_CONFLICT", 409);
       }
       return { withdrawal: safeWithdrawalView(previous), replayed: true };
     }
-    const [user] = await tx.select({ kycStatus: users.kycStatus }).from(users).where(eq(users.id, input.userId)).limit(1);
+    const [user] = await tx.select({ kycStatus: users.kycStatus, status: users.status }).from(users).where(eq(users.id, input.userId)).limit(1);
     if (!user) throw new ApiError("Pengguna tidak ditemukan.", "USER_NOT_FOUND", 404);
+    if (user.status !== "ACTIVE") throw new ApiError("Akun pengguna tidak aktif.", "USER_INACTIVE", 403);
     if (user.kycStatus !== "VERIFIED") throw new ApiError("KYC belum terverifikasi. Withdrawal belum dapat dilakukan.", "KYC_REQUIRED", 403);
 
     await tx.execute(sql`SELECT id FROM wallets WHERE user_id = ${input.userId} FOR UPDATE`);
     const [afterLock] = await tx.select().from(withdrawals).where(eq(withdrawals.idempotencyKey, input.idempotencyKey)).limit(1);
     if (afterLock) {
-      if (afterLock.userId !== input.userId || afterLock.amount !== input.amount) {
+      if (!sameWithdrawalIntent(afterLock, input)) {
         throw new ApiError("Idempotency key telah digunakan untuk withdrawal lain.", "IDEMPOTENCY_CONFLICT", 409);
       }
       return { withdrawal: safeWithdrawalView(afterLock), replayed: true };
@@ -139,9 +143,9 @@ export async function createWithdrawal(input: {
         walletId: wallet.id,
         userId: input.userId,
         amount: input.amount,
-        bankName: encryptBankPii(input.bankName),
-        accountName: encryptBankPii(input.accountName),
-        accountNumber: encryptBankPii(input.accountNumber),
+        bankName: encryptBankPii(input.bankName.trim()),
+        accountName: encryptBankPii(input.accountName.trim()),
+        accountNumber: encryptBankPii(input.accountNumber.trim()),
         idempotencyKey: input.idempotencyKey,
         status: "PENDING",
       })
@@ -234,19 +238,21 @@ export async function reconcileTopupPayment(input: { topupId: string; meta?: Req
   if (!provider.getPaymentStatus) throw new ApiError("Provider belum mendukung rekonsiliasi status pembayaran.", "PAYMENT_RECONCILIATION_UNAVAILABLE", 503);
   const [topup] = await db.select().from(topups).where(eq(topups.id, input.topupId)).limit(1);
   if (!topup) throw new ApiError("Top-up tidak ditemukan.", "TOPUP_NOT_FOUND", 404);
-  if (topup.status === "SUCCESS" || topup.status === "FAILED" || topup.status === "EXPIRED") return { topup, replayed: true };
-  const reference = topup.providerReference ?? topup.id;
+  if (topup.status === "SUCCESS") return { topup, replayed: true };
+  if (topup.provider !== provider.name) throw new ApiError("Provider aktif tidak cocok dengan intent top-up.", "PAYMENT_PROVIDER_MISMATCH", 409);
+  const reference = topup.id;
   const status = await provider.getPaymentStatus(reference);
-  if (status.amount && status.amount !== topup.amount) throw new ApiError("Nominal provider tidak cocok dengan top-up.", "PAYMENT_MISMATCH", 409);
+  if (status.provider !== topup.provider || status.reference !== topup.id || status.currency !== "IDR" || (status.status !== "PROCESSING" && status.amount !== topup.amount) || (status.amount !== 0 && status.amount !== topup.amount)) throw new ApiError("Nominal provider tidak cocok dengan top-up.", "PAYMENT_MISMATCH", 409);
   if (status.status === "PROCESSING") return { topup, replayed: false, providerStatus: status.status };
   const eventId = `RECONCILE-${topup.id}-${status.status}`;
   const result = await db.transaction(async (tx) => {
     await tx.execute(sql`SELECT id FROM topups WHERE id = ${topup.id} FOR UPDATE`);
     const [current] = await tx.select().from(topups).where(eq(topups.id, topup.id)).limit(1);
     if (!current) throw new ApiError("Top-up tidak ditemukan.", "TOPUP_NOT_FOUND", 404);
-    if (current.status === "SUCCESS" || current.status === "FAILED" || current.status === "EXPIRED") return current;
+    if (current.status === "SUCCESS") return current;
     if (status.status === "EXPIRED" || status.status === "FAILED") {
       const finalStatus = status.status;
+      if (current.status === "FAILED" || current.status === "EXPIRED") return current;
       await tx.update(topups).set({ status: finalStatus, updatedAt: new Date() }).where(eq(topups.id, current.id));
       await tx.insert(auditLogs).values({ actorType: "SYSTEM", action: finalStatus === "EXPIRED" ? "TOPUP_RECONCILED_EXPIRED" : "TOPUP_RECONCILED_FAILED", entityType: "topup", entityId: current.id, newValue: { eventId, providerStatus: status.status }, ipAddress: input.meta?.ipAddress ?? null, userAgent: input.meta?.userAgent ?? null });
       return { ...current, status: finalStatus };
@@ -261,9 +267,9 @@ export async function reconcileTopupPayment(input: { topupId: string; meta?: Req
       await tx.update(wallets).set({ availableBalance: availableAfter, updatedAt: now }).where(eq(wallets.id, wallet.id));
       await tx.insert(walletTransactions).values({ walletId: wallet.id, userId: current.userId, type: "TOPUP", direction: "CREDIT", amount: current.amount, availableBefore: wallet.availableBalance, availableAfter, lockedBefore: wallet.lockedBalance, lockedAfter: wallet.lockedBalance, pendingBefore: wallet.pendingBalance, pendingAfter: wallet.pendingBalance, referenceType: "topup", referenceId: current.id, description: "Top-up dipulihkan melalui rekonsiliasi provider", idempotencyKey: ledgerKey });
     }
-    await tx.update(topups).set({ status: "SUCCESS", providerReference: current.providerReference ?? status.providerReference ?? current.id, paidAt: current.paidAt ?? new Date(), updatedAt: new Date() }).where(eq(topups.id, current.id));
+    await tx.update(topups).set({ status: "SUCCESS", providerReference: current.providerReference ?? status.providerReference ?? null, paidAt: current.paidAt ?? new Date(), updatedAt: new Date() }).where(eq(topups.id, current.id));
     await tx.insert(auditLogs).values({ actorType: "SYSTEM", action: "TOPUP_RECONCILED_PAID", entityType: "topup", entityId: current.id, newValue: { eventId, providerStatus: status.status, amount: current.amount }, ipAddress: input.meta?.ipAddress ?? null, userAgent: input.meta?.userAgent ?? null });
-    return { ...current, status: "SUCCESS" as const };
+    return { ...current, status: "SUCCESS" as const, providerReference: current.providerReference ?? status.providerReference ?? null, paidAt: current.paidAt ?? new Date() };
   });
   return { topup: result, replayed: false, providerStatus: status.status };
 }

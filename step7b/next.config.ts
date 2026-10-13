@@ -1,4 +1,6 @@
 import type { NextConfig } from "next";
+import { fileURLToPath } from "node:url";
+const projectRoot = fileURLToPath(new URL(".", import.meta.url));
 
 const isProduction = process.env.NODE_ENV === "production";
 const contentSecurityPolicy = [
@@ -17,6 +19,8 @@ const contentSecurityPolicy = [
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  turbopack: { root: projectRoot },
+  outputFileTracingRoot: projectRoot,
   poweredByHeader: false,
   async headers() {
     return [{

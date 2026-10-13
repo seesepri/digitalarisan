@@ -7,15 +7,10 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const run = (cmd, args, options = {}) => execFileSync(cmd, args, { cwd: root, stdio: 'inherit', ...options });
 
+const expectedNpm = '10.9.2';
+if (execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim() !== expectedNpm) throw new Error(`BLOCKED: release npm version must be ${expectedNpm}`);
 console.log('[security] migration numbering/checksums');
-run(process.platform === 'win32' ? 'node' : 'sha256sum', process.platform === 'win32'
-  ? ['scripts/deploy/verify-migrations.mjs']
-  : ['--check', 'drizzle/MIGRATION_CHECKSUMS.sha256']);
-
-if (process.platform !== 'win32') {
-  // Python is retained for the existing migration policy check on Unix-like CI hosts.
-  run('python3', ['-c', `from pathlib import Path; import re; files=sorted(Path('drizzle').glob('[0-9][0-9][0-9][0-9]_*.sql')); nums=[int(re.match(r'^(\\d+)_',p.name).group(1)) for p in files]; assert nums==list(range(1,len(nums)+1)), nums; print(f'checked {len(files)} migrations')`]);
-}
+run('node', ['scripts/deploy/verify-migrations.mjs']);
 
 console.log('[security] tracked secret-like files');
 try {
@@ -24,7 +19,7 @@ try {
   if (bad.length) throw new Error(`tracked secret material detected: ${bad.join(', ')}`);
 } catch (err) {
   if (err?.status !== 128 && err?.code !== 'ENOENT') throw err;
-  console.warn('[security] WARNING: not a Git checkout; tracked-file secret scan skipped');
+  throw new Error('BLOCKED: a Git checkout is required for the release secret/provenance gate');
 }
 
 console.log('[security] dependency lock / reproducible Node.js build');
@@ -41,6 +36,8 @@ if (lockJson.lockfileVersion !== 3) {
 }
 run('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund']);
 run('npm', ['audit', '--omit=dev', '--audit-level=high']);
+// Build tools are part of the release supply chain; do not suppress their advisories.
+run('npm', ['audit', '--audit-level=moderate']);
 
 console.log('[security] release artifact integrity');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));

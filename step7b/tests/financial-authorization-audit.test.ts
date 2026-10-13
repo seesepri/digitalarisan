@@ -52,7 +52,8 @@ test("provider-originated money mutations are authenticated by provider verifica
   assert.match(webhook, /provider\.verifyWebhook/);
   assert.match(webhook, /event\.amount/);
   assert.match(webhook, /event\.currency/);
-  assert.match(webhook, /provider_reference/);
+  assert.match(webhook, /topups\.providerReference/);
+  assert.match(webhook, /eq\(topups\.provider, event\.provider\)/);
 
   const scheduler = read("src/app/api/v1/jobs/run/route.ts");
   assert.match(scheduler, /CRON_SECRET/);
@@ -71,7 +72,7 @@ test("refresh-token reuse revocation and audit commit before the request is reje
 test("withdrawal payout has maker-checker enforcement at provider execution", () => {
   const service = read("src/server/services/payout-withdrawal.ts");
   assert.match(service, /approvalStatus !== "APPROVED"/);
-  assert.match(service, /approvedBy === input\.adminId/);
+  assert.match(service, /approvedBy === adminId/);
   assert.match(service, /MAKER_CHECKER_SEPARATION_REQUIRED/);
   assert.match(service, /source === "PROVIDER"/);
 });
@@ -114,4 +115,11 @@ test("provider topup reconciliation is monotonic and permits PAID recovery after
   assert.match(webhook, /\["FAILED", "EXPIRED"\]\.includes\(topup\.status\)/);
   assert.match(webhook, /event\.status === "EXPIRED"/);
   assert.match(webhook, /event\.status === "FAILED"/);
+});
+
+test("manual job retry is an actual exported handler with server-side authorization", async () => {
+  const route = await import("@/app/api/v1/admin/jobs/[jobKey]/retry/route");
+  assert.equal(typeof route.POST, "function");
+  const source = read("src/app/api/v1/admin/jobs/[jobKey]/retry/route.ts");
+  assert.match(source,/await requireSuperAdmin\(request\)/); assert.match(source,/manuallyRetryJob\(jobKey, admin\.id/);
 });
