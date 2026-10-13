@@ -213,7 +213,7 @@ export async function resetPasswordWithPhoneCode(input: {
 
     const now = new Date();
     await tx.update(users).set({ passwordHash, updatedAt: now }).where(eq(users.id, user.id));
-    const revokedSessions = await tx.update(userSessions).set({ revokedAt: now })
+    const revokedSessions = await tx.update(userSessions).set({ revokedAt: now, revocationReason: "PASSWORD_RESET" })
       .where(and(eq(userSessions.userId, user.id), sql`${userSessions.revokedAt} IS NULL`))
       .returning({ id: userSessions.id });
     await tx.insert(auditLogs).values({

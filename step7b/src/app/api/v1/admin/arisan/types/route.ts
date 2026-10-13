@@ -1,7 +1,7 @@
 import { eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { arisanPeriods, arisanTypes, auditLogs } from "@/db/schema";
-import { ApiError, assertSameOrigin, errorResponse, getRequestMetadata, jsonOk, positiveInteger, readJson, requireAdmin, requireSuperAdmin, requiredString } from "@/server/http";
+import { enforceRateLimit, ApiError, assertSameOrigin, errorResponse, getRequestMetadata, jsonOk, positiveInteger, readJson, requireAdmin, requireSuperAdmin, requiredString } from "@/server/http";
 
 export async function GET(request: Request) {
   try {
@@ -31,6 +31,7 @@ export async function POST(request: Request) {
   try {
     assertSameOrigin(request);
     const admin = await requireSuperAdmin(request);
+    await enforceRateLimit(request, "admin-arisan-types", 10, 60_000, admin.id);
     const body = await readJson(request);
     const name = requiredString(body.name, "Nama jenis arisan", 3, 120);
     const description = typeof body.description === "string" ? body.description.trim().slice(0, 2000) : "";

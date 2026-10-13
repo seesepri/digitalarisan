@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
-const databaseUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL_TEST;
+const { configureTestDatabase } = await import("../scripts/test-database-guard.mjs");
+const databaseUrl = await configureTestDatabase();
 
 test("v11 integration suite requires TEST_DATABASE_URL", { skip: !databaseUrl }, async (t: import("node:test").TestContext) => {
   process.env.DATABASE_URL = databaseUrl!;
@@ -17,10 +18,12 @@ test("v11 integration suite requires TEST_DATABASE_URL", { skip: !databaseUrl },
     import("@/server/services/reconciliation"),
     import("@/server/services/ledger"),
   ]);
+  t.after(async () => { await pool.end(); });
   const { and, inArray, sql, eq } = await import("drizzle-orm");
 
   await db.execute(sql`DO $$ DECLARE r RECORD; BEGIN FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> '__drizzle_migrations') LOOP EXECUTE format('TRUNCATE TABLE %I CASCADE', r.tablename); END LOOP; END $$;`);
 
+  const [kycReviewer] = await db.insert(schema.users).values({ name: "Isolated KYC reviewer", phone: "+6281199999999", passwordHash: "test-only", role: "SUPER_ADMIN", status: "ACTIVE", phoneVerifiedAt: new Date() }).returning();
   const makeUser = async (n: number, balance = 100_000) => {
     const [user] = await db.insert(schema.users).values({
       name: `Integration User ${n}`,
@@ -29,6 +32,8 @@ test("v11 integration suite requires TEST_DATABASE_URL", { skip: !databaseUrl },
       passwordHash: "test-only",
       role: "USER",
       status: "ACTIVE",
+      kycStatus: "VERIFIED",
+      kycReviewedBy: kycReviewer.id,
     }).returning();
     const [walletRow] = await db.insert(schema.wallets).values({ userId: user.id, availableBalance: balance }).returning();
     if (balance > 0) {
@@ -86,7 +91,8 @@ test("v11 integration suite requires TEST_DATABASE_URL", { skip: !databaseUrl },
     }).returning();
     const key = `DUP-JOIN-${randomUUID()}`;
     const joined = await Promise.all([0, 1].map(() => arisan.joinPeriod({ periodId: period.id, userId: user.user.id, idempotencyKey: key }).catch((e) => e)));
-    assert.equal(joined.filter((x) => !(x instanceof Error)).length, 1);
+    assert.equal(joined.filter((x) => !(x instanceof Error)).length, 2);
+    assert.equal(joined.filter((x) => !(x instanceof Error) && x.replayed).length, 1);
     assert.equal((await db.select().from(schema.arisanParticipants).where(eq(schema.arisanParticipants.periodId, period.id))).length, 1);
 
     const withdrawalKey = `DUP-WITHDRAW-${randomUUID()}`;
@@ -102,7 +108,7 @@ test("v11 integration suite requires TEST_DATABASE_URL", { skip: !databaseUrl },
   await t.test("concurrent withdrawal cannot overspend available balance", async () => {
     const user = await makeUser(100, 100_000);
     const attempts = await Promise.all(Array.from({ length: 20 }, (_, i) => wallet.createWithdrawal({
-      userId: user.user.id, amount: 20_000, bankName: "TEST", accountName: "Concurrent", accountNumber: "999", idempotencyKey: `W-${i}-${randomUUID()}`,
+      userId: user.user.id, amount: 20_000, bankName: "TEST", accountName: "Concurrent", accountNumber: "999999", idempotencyKey: `W-${i}-${randomUUID()}`,
     }).then(() => true).catch(() => false)));
     assert.equal(attempts.filter(Boolean).length, 5);
     const [w] = await db.select().from(schema.wallets).where(eq(schema.wallets.userId, user.user.id));
@@ -116,10 +122,11 @@ test("v11 integration suite requires TEST_DATABASE_URL", { skip: !databaseUrl },
     const now = new Date();
     const [type] = await db.insert(schema.arisanTypes).values({ name: `Draw Type ${randomUUID()}`, contributionAmount: 100_000, minimumParticipants: 2, maximumParticipants: 3, platformFeeBps: 100, cancellationDeadlineDays: 1 }).returning();
     const [period] = await db.insert(schema.arisanPeriods).values({
-      typeId: type.id, code: `INT-DRAW-${randomUUID()}`, registrationStartsAt: new Date(now.getTime() - 360000), registrationEndsAt: new Date(now.getTime() - 180000),
-      drawingAt: new Date(now.getTime() - 60_000), cancellationDeadlineAt: new Date(now.getTime() - 120_000), minimumParticipants: 2, maximumParticipants: 3, contributionAmount: 100_000, platformFeeBps: 100, status: "OPEN",
+      typeId: type.id, code: `INT-DRAW-${randomUUID()}`, registrationStartsAt: new Date(now.getTime() - 360000), registrationEndsAt: new Date(now.getTime() + 180000),
+      drawingAt: new Date(now.getTime() + 360_000), cancellationDeadlineAt: new Date(now.getTime() + 120_000), minimumParticipants: 2, maximumParticipants: 3, contributionAmount: 100_000, platformFeeBps: 100, status: "OPEN",
     }).returning();
     for (let i = 0; i < users.length; i++) await arisan.joinPeriod({ periodId: period.id, userId: users[i].user.id, idempotencyKey: `DRAW-JOIN-${i}-${randomUUID()}` });
+    await db.update(schema.arisanPeriods).set({ registrationEndsAt: new Date(now.getTime() - 180000), drawingAt: new Date(now.getTime() - 60000), cancellationDeadlineAt: new Date(now.getTime() - 120000) }).where(eq(schema.arisanPeriods.id, period.id));
     const results = await Promise.all([0, 1, 2, 3].map(() => arisan.drawAndSettle({ periodId: period.id, actorType: "SYSTEM" }).then(() => true).catch(() => false)));
     assert.equal(results.filter(Boolean).length, 1);
     const [updatedPeriod] = await db.select().from(schema.arisanPeriods).where(eq(schema.arisanPeriods.id, period.id));
@@ -166,13 +173,14 @@ test("v11 integration suite requires TEST_DATABASE_URL", { skip: !databaseUrl },
   });
 
   await t.test("concurrent ledger reversals serialize and create only one compensating entry", async () => {
-    const walletTxRows = await db.select().from(schema.walletTransactions).limit(1);
-    if (!walletTxRows[0]) return;
+    const reversalUser = await makeUser(501, 100_000);
+    const walletTxRows = await db.select().from(schema.walletTransactions).where(eq(schema.walletTransactions.walletId, reversalUser.wallet.id));
+    assert.ok(walletTxRows[0]);
     const originalWalletTx = walletTxRows[0];
 
     const walletReversals = await Promise.all([
-      ledger.reverseWalletTransaction({ transactionId: originalWalletTx.id, idempotencyKey: `REV-RACE-A-${originalWalletTx.id}`, reason: "concurrency A" }),
-      ledger.reverseWalletTransaction({ transactionId: originalWalletTx.id, idempotencyKey: `REV-RACE-B-${originalWalletTx.id}`, reason: "concurrency B" }),
+      ledger.reverseWalletTransaction({ actorId: kycReviewer.id, transactionId: originalWalletTx.id, idempotencyKey: `REV-RACE-A-${originalWalletTx.id}`, reason: "concurrency A" }),
+      ledger.reverseWalletTransaction({ actorId: kycReviewer.id, transactionId: originalWalletTx.id, idempotencyKey: `REV-RACE-B-${originalWalletTx.id}`, reason: "concurrency B" }),
     ]);
     const walletCompensating = await db.select().from(schema.walletTransactions).where(eq(schema.walletTransactions.reversalOfId, originalWalletTx.id));
     assert.equal(walletCompensating.length, 1);
@@ -193,8 +201,8 @@ walletReversals.filter((row) => row !== undefined && row.replayed).length,
     }).returning();
 
     const financialReversals = await Promise.all([
-      ledger.reverseFinancialTransaction({ transactionId: originalFinancialTx.id, idempotencyKey: `FIN-REV-RACE-A-${originalFinancialTx.id}`, reason: "concurrency A" }),
-      ledger.reverseFinancialTransaction({ transactionId: originalFinancialTx.id, idempotencyKey: `FIN-REV-RACE-B-${originalFinancialTx.id}`, reason: "concurrency B" }),
+      ledger.reverseFinancialTransaction({ actorId: kycReviewer.id, transactionId: originalFinancialTx.id, idempotencyKey: `FIN-REV-RACE-A-${originalFinancialTx.id}`, reason: "concurrency A" }),
+      ledger.reverseFinancialTransaction({ actorId: kycReviewer.id, transactionId: originalFinancialTx.id, idempotencyKey: `FIN-REV-RACE-B-${originalFinancialTx.id}`, reason: "concurrency B" }),
     ]);
     const financialCompensating = await db.select().from(schema.financialTransactions).where(eq(schema.financialTransactions.reversalOfId, originalFinancialTx.id));
     assert.equal(financialCompensating.length, 1);
@@ -206,18 +214,19 @@ walletReversals.filter((row) => row !== undefined && row.replayed).length,
   await t.test("immutable ledgers reject UPDATE and DELETE and reconciliation passes after settlement", async () => {
     const walletTxRows = await db.select().from(schema.walletTransactions).limit(1);
     if (walletTxRows[0]) {
-      await assert.rejects(() => db.execute(sql`UPDATE wallet_transactions SET description = 'tamper' WHERE id = ${walletTxRows[0].id}`), /IMMUTABLE_LEDGER/);
-      await assert.rejects(() => db.execute(sql`DELETE FROM wallet_transactions WHERE id = ${walletTxRows[0].id}`), /IMMUTABLE_LEDGER/);
+      await assert.rejects(() => db.execute(sql`UPDATE wallet_transactions SET description = 'tamper' WHERE id = ${walletTxRows[0].id}`), (error: unknown) => error instanceof Error && error.cause instanceof Error && /IMMUTABLE_LEDGER/.test(error.cause.message));
+      await assert.rejects(() => db.execute(sql`DELETE FROM wallet_transactions WHERE id = ${walletTxRows[0].id}`), (error: unknown) => error instanceof Error && error.cause instanceof Error && /IMMUTABLE_LEDGER/.test(error.cause.message));
     }
     const run = await reconciliation.runAccountingReconciliation();
-    assert.equal(run.status, "PASS");
+    assert.equal(run.status, "PASS", JSON.stringify(run.issues));
     assert.equal(run.issueCount, 0);
   });
 
   await t.test("ledger reversal is append-only and creates a compensating entry", async () => {
-    const txRows = await db.select().from(schema.walletTransactions).limit(1);
-    if (!txRows[0]) return;
-    const reversal = await ledger.reverseWalletTransaction({ transactionId: txRows[0].id, idempotencyKey: `REVERSAL-${txRows[0].id}`, reason: "integration test" });
+    const reversalUser = await makeUser(502, 100_000);
+    const txRows = await db.select().from(schema.walletTransactions).where(eq(schema.walletTransactions.walletId, reversalUser.wallet.id));
+    assert.ok(txRows[0]);
+    const reversal = await ledger.reverseWalletTransaction({ actorId: kycReviewer.id, transactionId: txRows[0].id, idempotencyKey: `REVERSAL-${txRows[0].id}`, reason: "integration test" });
     assert.ok(reversal, "reversal must exist");
     assert.ok(reversal.transaction.id);
     const [original] = await db.select().from(schema.walletTransactions).where(eq(schema.walletTransactions.id, txRows[0].id));
@@ -226,5 +235,4 @@ walletReversals.filter((row) => row !== undefined && row.replayed).length,
     assert.ok(compensating);
   });
 
-  await pool.end();
 });

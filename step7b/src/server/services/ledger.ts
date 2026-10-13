@@ -1,6 +1,6 @@
 import { eq, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { financialAccounts, financialTransactions, walletTransactions, wallets } from "@/db/schema";
+import { auditLogs, financialAccounts, financialTransactions, walletTransactions, wallets, users } from "@/db/schema";
 import { ApiError } from "@/server/http";
 
 /**
@@ -10,10 +10,13 @@ import { ApiError } from "@/server/http";
  */
 export async function reverseWalletTransaction(input: {
   transactionId: string;
+  actorId: string;
   idempotencyKey: string;
   reason: string;
 }) {
   return db.transaction(async (tx) => {
+    const [operator] = await tx.select({ role: users.role, status: users.status }).from(users).where(eq(users.id, input.actorId)).limit(1);
+    if (!operator || operator.role !== "SUPER_ADMIN" || operator.status !== "ACTIVE") throw new ApiError("Koreksi ledger memerlukan super administrator aktif.", "FORBIDDEN", 403);
     const [original] = await tx
       .select()
       .from(walletTransactions)
@@ -22,6 +25,8 @@ export async function reverseWalletTransaction(input: {
     if (!original) throw new ApiError("Transaksi wallet tidak ditemukan.", "LEDGER_ENTRY_NOT_FOUND", 404);
     if (original.status !== "SUCCESS") throw new ApiError("Hanya transaksi SUCCESS yang dapat direversal.", "LEDGER_ENTRY_NOT_REVERSIBLE", 409);
 
+    const [byKey] = await tx.select().from(walletTransactions).where(eq(walletTransactions.idempotencyKey, input.idempotencyKey)).limit(1);
+    if (byKey && byKey.reversalOfId !== original.id) throw new ApiError("Idempotency key koreksi telah digunakan untuk transaksi lain.", "IDEMPOTENCY_CONFLICT", 409);
     const [existing] = await tx
       .select()
       .from(walletTransactions)
@@ -44,6 +49,7 @@ export async function reverseWalletTransaction(input: {
       .limit(1);
     if (existingAfterLock) return { transaction: existingAfterLock, replayed: true };
 
+    if (original.lockedAfter !== original.lockedBefore || original.pendingAfter !== original.pendingBefore) throw new ApiError("Transaksi reservation/withdrawal harus dipulihkan melalui state machine domain dengan bukti provider, bukan reversal generik.", "LEDGER_DOMAIN_RECOVERY_REQUIRED", 409);
     const availableDelta = original.availableAfter - original.availableBefore;
     const lockedDelta = original.lockedAfter - original.lockedBefore;
     const pendingDelta = original.pendingAfter - original.pendingBefore;
@@ -76,11 +82,13 @@ export async function reverseWalletTransaction(input: {
     }).returning();
 
     await tx.update(wallets).set({
-    availableBalance: availableAfter,
-    lockedBalance: lockedAfter,
-    pendingBalance: pendingAfter,
-    updatedAt: new Date(),
-}).where(eq(wallets.id, wallet.id));
+      availableBalance: availableAfter,
+      lockedBalance: lockedAfter,
+      pendingBalance: pendingAfter,
+      updatedAt: new Date(),
+    }).where(eq(wallets.id, wallet.id));
+    await tx.insert(auditLogs).values({ actorId: input.actorId, actorType: "SUPER_ADMIN", action: "WALLET_LEDGER_REVERSED", entityType: "wallet_transaction", entityId: created.id, newValue: { reversalOfId: original.id, reason: input.reason, idempotencyKey: input.idempotencyKey } });
+    return { transaction: created, replayed: false };
   });
 }
 
@@ -90,10 +98,13 @@ export async function reverseWalletTransaction(input: {
  */
 export async function reverseFinancialTransaction(input: {
   transactionId: string;
+  actorId: string;
   idempotencyKey: string;
   reason: string;
 }) {
   return db.transaction(async (tx) => {
+    const [operator] = await tx.select({ role: users.role, status: users.status }).from(users).where(eq(users.id, input.actorId)).limit(1);
+    if (!operator || operator.role !== "SUPER_ADMIN" || operator.status !== "ACTIVE") throw new ApiError("Koreksi ledger memerlukan super administrator aktif.", "FORBIDDEN", 403);
     const [original] = await tx
       .select()
       .from(financialTransactions)
@@ -101,6 +112,8 @@ export async function reverseFinancialTransaction(input: {
       .limit(1);
     if (!original) throw new ApiError("Transaksi financial tidak ditemukan.", "FINANCIAL_LEDGER_ENTRY_NOT_FOUND", 404);
 
+    const [byKey] = await tx.select().from(financialTransactions).where(eq(financialTransactions.idempotencyKey, input.idempotencyKey)).limit(1);
+    if (byKey && byKey.reversalOfId !== original.id) throw new ApiError("Idempotency key koreksi telah digunakan untuk transaksi lain.", "IDEMPOTENCY_CONFLICT", 409);
     const [existing] = await tx
       .select()
       .from(financialTransactions)
@@ -140,6 +153,7 @@ export async function reverseFinancialTransaction(input: {
     }).returning();
 
     await tx.update(financialAccounts).set({ balance: balanceAfter, updatedAt: new Date() }).where(eq(financialAccounts.id, original.accountId));
+    await tx.insert(auditLogs).values({ actorId: input.actorId, actorType: "SUPER_ADMIN", action: "FINANCIAL_LEDGER_REVERSED", entityType: "financial_transaction", entityId: created.id, newValue: { reversalOfId: original.id, reason: input.reason, idempotencyKey: input.idempotencyKey } });
     return { transaction: created, replayed: false };
   });
 }

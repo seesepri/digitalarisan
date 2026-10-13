@@ -1,0 +1,11 @@
+import { readdirSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+const databaseSuites = new Set(['concurrency-idempotency.test.ts', 'crash-restart-recovery.test.ts', 'integration-financial.test.ts']);
+const files = readdirSync('tests').filter((file) => /\.test\.(ts|mjs)$/.test(file) && !file.endsWith('.integration.test.ts') && !databaseSuites.has(file)).map((file) => `tests/${file}`);
+for (const dir of ['tests/api', 'tests/performance']) for (const file of readdirSync(dir)) if (/\.test\.mjs$/.test(file)) files.push(`${dir}/${file}`);
+const env = { ...process.env, NODE_ENV: 'test', DATABASE_URL: 'postgresql://127.0.0.1:1/unit_test', AUTH_SECRET: 'isolated-test-only-not-a-production-secret', NEXT_TELEMETRY_DISABLED: '1' };
+delete env.TEST_DATABASE_URL;
+delete env.DATABASE_URL_TEST;
+const result = spawnSync(process.execPath, ['--import', 'tsx', '--test', '--test-concurrency=1', ...files.sort()], { stdio: 'inherit', env });
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);

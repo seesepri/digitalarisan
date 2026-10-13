@@ -1,12 +1,14 @@
 import { and, asc, eq, gt, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { getPayoutProvider, stablePayoutReference } from "@/server/services/payout-provider";
+import { assertDisbursementEvidence, getPayoutProvider, stablePayoutReference } from "@/server/services/payout-provider";
+import { ApiError } from "@/server/http";
 import { processWithdrawal } from "@/server/services/payout-withdrawal";
 import {
   arisanParticipants,
   arisanPeriods,
   topups,
   withdrawals,
+  users,
   financialAccounts,
   financialTransactions,
   platformFees,
@@ -18,7 +20,7 @@ import {
   wallets,
 } from "@/db/schema";
 
-type Scope = { periodId?: string | null };
+type Scope = { periodId?: string | null; recoverProviderSuccess?: boolean; recoveryActorId?: string };
 
 type Issue = {
   severity: "CRITICAL" | "WARNING";
@@ -33,6 +35,10 @@ type Issue = {
 const money = (value: unknown) => Number(value ?? 0);
 
 export async function runAccountingReconciliation(scope: Scope = {}) {
+  if (scope.recoverProviderSuccess) {
+    const [actor] = scope.recoveryActorId ? await db.select({ role: users.role, status: users.status }).from(users).where(eq(users.id, scope.recoveryActorId)).limit(1) : [];
+    if (!actor || actor.role !== "SUPER_ADMIN" || actor.status !== "ACTIVE") throw new ApiError("Recovery finansial eksplisit memerlukan super administrator aktif.", "FORBIDDEN", 403);
+  }
   const startedAt = new Date();
   const result = await db.transaction(async (tx) => {
     // A repeatable-read snapshot makes the whole report internally consistent.
@@ -101,12 +107,16 @@ export async function runAccountingReconciliation(scope: Scope = {}) {
       LEFT JOIN withdrawals w ON wt.reference_type = 'withdrawal' AND wt.reference_id = w.id
       LEFT JOIN payouts p ON wt.reference_type = 'payout' AND wt.reference_id = p.id
       LEFT JOIN arisan_periods ap ON wt.reference_type = 'arisan_period' AND wt.reference_id = ap.id
+      LEFT JOIN arisan_participants participant ON wt.reference_type = 'arisan_participant' AND wt.reference_id = participant.id
+      LEFT JOIN wallet_transactions original ON wt.reference_type = 'wallet_transaction_reversal' AND wt.reference_id = original.id
       WHERE wt.reference_id IS NULL
          OR (wt.reference_type = 'topup' AND t.id IS NULL)
          OR (wt.reference_type = 'withdrawal' AND w.id IS NULL)
          OR (wt.reference_type = 'payout' AND p.id IS NULL)
          OR (wt.reference_type = 'arisan_period' AND ap.id IS NULL)
-         OR wt.reference_type NOT IN ('topup', 'withdrawal', 'payout', 'arisan_period')
+         OR (wt.reference_type = 'arisan_participant' AND (participant.id IS NULL OR participant.user_id <> wt.user_id))
+         OR (wt.reference_type = 'wallet_transaction_reversal' AND (original.id IS NULL OR original.wallet_id <> wt.wallet_id OR wt.reversal_of_id IS DISTINCT FROM original.id))
+         OR wt.reference_type NOT IN ('topup', 'withdrawal', 'payout', 'arisan_period', 'arisan_participant', 'wallet_transaction_reversal')
     `);
     for (const row of orphanWalletRows.rows as Array<Record<string, unknown>>) {
       add({ severity: "CRITICAL", code: "WALLET_LEDGER_ORPHAN_PARENT", entityType: "wallet_transaction", entityId: String(row.id), expectedValue: { referenceType: row.referenceType, referenceId: row.referenceId }, actualValue: row, message: "Wallet ledger tidak memiliki parent transaction yang valid." });
@@ -134,12 +144,35 @@ export async function runAccountingReconciliation(scope: Scope = {}) {
       add({ severity: "CRITICAL", code: "PARENT_TRANSACTION_WITHOUT_LEDGER", entityType: "withdrawal", entityId: String(row.id), expectedValue: { walletLedger: true }, actualValue: { walletLedger: false, status: row.status }, message: "Withdrawal tidak memiliki wallet ledger." });
     }
 
+    const pendingRows = await tx.execute(sql`
+      SELECT w.id, w.pending_balance, COALESCE(reserved.amount, 0) AS expected
+      FROM wallets w LEFT JOIN (
+        SELECT wallet_id, SUM(amount) AS amount FROM withdrawals WHERE status IN ('PENDING', 'PROCESSING', 'FAILED_RETRYABLE') GROUP BY wallet_id
+      ) reserved ON reserved.wallet_id = w.id WHERE w.pending_balance <> COALESCE(reserved.amount, 0)
+    `);
+    for (const row of pendingRows.rows as Array<Record<string, unknown>>) {
+      add({ code: "WALLET_PENDING_WITHDRAWAL_MISMATCH", entityType: "wallet", entityId: String(row.id), expectedValue: { pending: row.expected }, actualValue: { pending: row.pending_balance }, message: "Saldo pending tidak sama dengan withdrawal aktif." });
+    }
+    const missingClosingLedger = await tx.execute(sql`
+      SELECT w.id, w.status FROM withdrawals w WHERE w.status IN ('SUCCESS', 'FAILED_FINAL')
+      AND NOT EXISTS (SELECT 1 FROM wallet_transactions wt WHERE wt.reference_type = 'withdrawal' AND wt.reference_id = w.id
+        AND wt.idempotency_key = 'WITHDRAWAL-' || w.id::text || '-' || w.status::text)
+    `);
+    for (const row of missingClosingLedger.rows as Array<Record<string, unknown>>) {
+      add({ code: "WITHDRAWAL_TERMINAL_LEDGER_MISSING", entityType: "withdrawal", entityId: String(row.id), actualValue: { status: row.status }, message: "Withdrawal terminal tidak memiliki ledger penyelesaian/refund; jangan mengarang koreksi tanpa bukti provider." });
+    }
+    const walletsWithoutLedger = await tx.execute(sql`
+      SELECT w.id FROM wallets w WHERE (w.available_balance <> 0 OR w.locked_balance <> 0 OR w.pending_balance <> 0)
+      AND NOT EXISTS (SELECT 1 FROM wallet_transactions wt WHERE wt.wallet_id = w.id)
+    `);
+    for (const row of walletsWithoutLedger.rows as Array<Record<string, unknown>>) add({ code: "WALLET_BALANCE_WITHOUT_LEDGER", entityType: "wallet", entityId: String(row.id), message: "Wallet bersaldo tidak memiliki riwayat ledger." });
+
     const withdrawalMetadataIssues = await tx.execute(sql`
       SELECT id, status, provider_reference AS "providerReference",
              last_error_code AS "lastErrorCode", last_error_message AS "lastErrorMessage",
              next_retry_at AS "nextRetryAt"
       FROM withdrawals
-      WHERE (status = 'SUCCESS' AND provider_reference IS NULL)
+      WHERE (status = 'SUCCESS' AND (provider_reference IS NULL OR btrim(provider_reference) = '' OR last_provider_evidence IS NULL))
          OR (status = 'FAILED_FINAL' AND (
               last_error_code = 'PROVIDER_RETRYABLE_FAILURE'
               OR last_error_message ILIKE '%dana tetap ditahan untuk retry%'
@@ -235,7 +268,7 @@ export async function runAccountingReconciliation(scope: Scope = {}) {
       const walletIds: string[] = walletIdRows.map((row) => row.walletId);
       if (!walletIds.length) break;
     for (const walletId of walletIds) {
-      const txRows = await tx.select().from(walletTransactions).where(eq(walletTransactions.walletId, walletId)).orderBy(asc(walletTransactions.createdAt), asc(walletTransactions.id));
+      const txRows = await tx.select().from(walletTransactions).where(eq(walletTransactions.walletId, walletId)).orderBy(asc(walletTransactions.ledgerSequence));
       let previous: typeof txRows[number] | null = null;
       for (const row of txRows) {
         const availableBefore = money(row.availableBefore);
@@ -246,6 +279,9 @@ export async function runAccountingReconciliation(scope: Scope = {}) {
         const pendingAfter = money(row.pendingAfter);
         const amount = money(row.amount);
 
+        if (!previous && (availableBefore !== 0 || lockedBefore !== 0 || pendingBefore !== 0)) {
+          add({ code: "WALLET_LEDGER_OPENING_MISMATCH", entityType: "wallet_transaction", entityId: row.id, actualValue: { availableBefore, lockedBefore, pendingBefore }, message: "Opening ledger wallet bukan nol; bukti opening balance historis diperlukan." });
+        }
         if (previous && (availableBefore !== money(previous.availableAfter) || lockedBefore !== money(previous.lockedAfter) || pendingBefore !== money(previous.pendingAfter))) {
           add({ code: "WALLET_LEDGER_CHAIN_BROKEN", entityType: "wallet_transaction", entityId: row.id, expectedValue: { availableBefore: money(previous.availableAfter), lockedBefore: money(previous.lockedAfter), pendingBefore: money(previous.pendingAfter) }, actualValue: { availableBefore, lockedBefore, pendingBefore }, message: "Rantai saldo wallet transaction terputus." });
         }
@@ -339,7 +375,7 @@ export async function runAccountingReconciliation(scope: Scope = {}) {
     // 4. Financial account ledger continuity and balance.
     const accounts = await tx.select().from(financialAccounts).where(scope.periodId ? eq(financialAccounts.periodId, scope.periodId) : sql`true`);
     for (const account of accounts) {
-      const rows = await tx.select().from(financialTransactions).where(eq(financialTransactions.accountId, account.id)).orderBy(asc(financialTransactions.createdAt), asc(financialTransactions.id));
+      const rows = await tx.select().from(financialTransactions).where(eq(financialTransactions.accountId, account.id)).orderBy(asc(financialTransactions.ledgerSequence));
       let expectedBalance = 0;
       let previous: typeof rows[number] | null = null;
       for (const row of rows) {
@@ -525,55 +561,52 @@ export async function runAccountingReconciliation(scope: Scope = {}) {
     providerIssuePreview.push(...batch.slice(0, Math.max(0, 50 - providerIssuePreview.length)));
   };
   try {
-    const provider = getPayoutProvider();
     const batchSize = Math.max(10, Math.min(200, Number(process.env.RECONCILIATION_PROVIDER_BATCH_SIZE) || 100));
     let afterId: string | null = null;
     while (true) {
-      const processingWithdrawals: Array<{ id: string; providerReference: string | null }> = await db.select({
-        id: withdrawals.id,
-        providerReference: withdrawals.providerReference,
+      const processingWithdrawals = await db.select({
+        id: withdrawals.id, providerReference: withdrawals.providerReference, provider: withdrawals.provider,
+        amount: withdrawals.amount, attemptCount: withdrawals.attemptCount,
       }).from(withdrawals).where(afterId
         ? and(eq(withdrawals.status, "PROCESSING"), gt(withdrawals.id, afterId))
         : eq(withdrawals.status, "PROCESSING")).orderBy(withdrawals.id).limit(batchSize);
       if (!processingWithdrawals.length) break;
       const batchIssues: Issue[] = [];
       for (const withdrawal of processingWithdrawals) {
-        const reference = withdrawal.providerReference || stablePayoutReference(withdrawal.id);
-        let status: Awaited<ReturnType<typeof provider.getDisbursementStatus>>;
+        // Status endpoint is keyed by OUR stable request reference, never by the provider's external ID.
+        const reference = stablePayoutReference(withdrawal.id);
         try {
-          status = await provider.getDisbursementStatus(reference);
+          if (!withdrawal.provider) throw new ApiError("Provider withdrawal legacy tidak diketahui; verifikasi identitas provider dahulu.", "PAYOUT_PROVIDER_IDENTITY_REQUIRED", 409);
+          const provider = getPayoutProvider(withdrawal.provider);
+          const status = await provider.getDisbursementStatus(reference);
+          if (status.status === "UNKNOWN") {
+            batchIssues.push({ severity: "CRITICAL", code: "PROVIDER_STATUS_UNKNOWN", entityType: "withdrawal", entityId: withdrawal.id, message: "404/status ambigu bukan bukti gagal; dana/status tidak diubah." });
+            continue;
+          }
+          assertDisbursementEvidence(status, { reference, amount: withdrawal.amount, provider: withdrawal.provider, providerReference: withdrawal.providerReference });
+          if (status.status === "SUCCESS") {
+            if (!scope.recoverProviderSuccess) {
+              batchIssues.push({ severity: "CRITICAL", code: "PROVIDER_SUCCESS_DB_PROCESSING", entityType: "withdrawal", entityId: withdrawal.id, actualValue: { providerStatus: status.status, providerReference: status.providerReference, recovery: "NOT_REQUESTED" }, message: "Provider SUCCESS diverifikasi, tetapi mode audit tidak mengubah status/saldo. Recovery eksplisit perlu approval super-admin." });
+              continue;
+            }
+            const finalized = await processWithdrawal({
+              withdrawalId: withdrawal.id, decision: "SUCCESS", adminRole: "SYSTEM", adminId: scope.recoveryActorId,
+              source: "PROVIDER", providerEvidence: status, expectedAttemptCount: withdrawal.attemptCount,
+            });
+            batchIssues.push({ severity: "CRITICAL", code: "PROVIDER_SUCCESS_DB_PROCESSING", entityType: "withdrawal", entityId: withdrawal.id, actualValue: { dbStatus: finalized.status, providerStatus: status.status, recovery: finalized.replayed ? "ALREADY_FINALIZED" : "FINALIZED" }, message: "Recovery eksplisit memakai bukti provider, row lock, attempt fencing, dan ledger idempotent." });
+          } else if (status.status === "FAILED_FINAL" || status.status === "FAILED_RETRYABLE") {
+            batchIssues.push({ severity: "CRITICAL", code: "PROVIDER_FAILURE_DB_PROCESSING", entityType: "withdrawal", entityId: withdrawal.id, actualValue: { providerStatus: status.status }, message: "Kegagalan provider terkonfirmasi; audit tidak melakukan retry/refund otomatis." });
+          }
         } catch (error) {
-          batchIssues.push({ severity: "WARNING", code: "PROVIDER_STATUS_UNAVAILABLE", entityType: "withdrawal", entityId: withdrawal.id, expectedValue: { providerStatus: "CHECKABLE" }, actualValue: { error: error instanceof Error ? error.message : String(error) }, message: "Status payout provider tidak dapat diverifikasi saat reconciliation." });
-          continue;
+          batchIssues.push({ severity: "CRITICAL", code: "PROVIDER_SUCCESS_RECOVERY_FAILED", entityType: "withdrawal", entityId: withdrawal.id, actualValue: { error: error instanceof Error ? error.message : String(error) }, message: "Status/bukti payout tidak dapat diverifikasi atau recovery gagal; jangan ubah saldo." });
         }
-
-        if (status.status === "SUCCESS") {
-        // External SUCCESS is authoritative: recover the local state through the
-        // same row-locked/idempotent finalizer used by the normal provider path.
-        // The provider call stays outside the DB transaction; only the local
-        // state transition + wallet ledger are atomic. A concurrent reconciler
-        // will acquire the row lock afterwards and receive a terminal replay,
-        // so it cannot create a second debit/credit.
-        try {
-          const finalized = await processWithdrawal({
-            withdrawalId: withdrawal.id,
-            decision: "SUCCESS",
-            adminRole: "SYSTEM",
-            source: "PROVIDER",
-            providerReference: status.providerReference,
-          });
-          batchIssues.push({ severity: "CRITICAL", code: "PROVIDER_SUCCESS_DB_PROCESSING", entityType: "withdrawal", entityId: withdrawal.id, expectedValue: { dbStatus: "SUCCESS" }, actualValue: { dbStatus: finalized.status, providerStatus: status.status, providerReference: status.providerReference, recovery: finalized.replayed ? "ALREADY_FINALIZED" : "FINALIZED" }, message: finalized.replayed ? "Provider SUCCESS terdeteksi; withdrawal sudah terlebih dahulu difinalisasi oleh proses lain." : "Provider SUCCESS direkonsiliasi dan withdrawal difinalisasi tepat satu kali." });
-        } catch (error) {
-          batchIssues.push({ severity: "CRITICAL", code: "PROVIDER_SUCCESS_RECOVERY_FAILED", entityType: "withdrawal", entityId: withdrawal.id, expectedValue: { dbStatus: "SUCCESS", walletDebitCount: 1 }, actualValue: { dbStatus: "PROCESSING", providerStatus: status.status, error: error instanceof Error ? error.message : String(error) }, message: "Provider SUCCESS terdeteksi tetapi finalisasi internal gagal; dana tidak boleh dipotong ulang dan kasus harus diulang/diperiksa." });
-        }
-      }
       }
       await persistProviderIssues(batchIssues);
       afterId = processingWithdrawals[processingWithdrawals.length - 1].id;
       if (processingWithdrawals.length < batchSize) break;
     }
   } catch (error) {
-    await persistProviderIssues([{ severity: "WARNING", code: "PROVIDER_RECONCILIATION_UNAVAILABLE", entityType: "provider", expectedValue: { configured: true }, actualValue: { error: error instanceof Error ? error.message : String(error) }, message: "Provider payout tidak tersedia untuk pemeriksaan external state." }]);
+    await persistProviderIssues([{ severity: "CRITICAL", code: "PROVIDER_RECONCILIATION_UNAVAILABLE", entityType: "provider", actualValue: { error: error instanceof Error ? error.message : String(error) }, message: "Provider payout tidak tersedia untuk pemeriksaan external state." }]);
   }
 
   if (providerIssueCount) {

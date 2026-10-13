@@ -1,42 +1,30 @@
 import { Pool } from 'pg';
-import { randomBytes, createCipheriv } from 'node:crypto';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
+import { execFileSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { verifyMigrationFiles } from './verify-migrations.mjs';
 
-const url = process.env.DATABASE_URL;
-const piiKeyRaw = process.env.BANK_PII_ENCRYPTION_KEY?.trim();
-if (!url) throw new Error('DATABASE_URL is required');
-if (!piiKeyRaw) throw new Error('BANK_PII_ENCRYPTION_KEY is required for production migration');
-const piiKey = Buffer.from(piiKeyRaw, 'base64');
-if (piiKey.length !== 32) throw new Error('BANK_PII_ENCRYPTION_KEY must decode to exactly 32 bytes');
-
-function encrypt(value) {
-  if (!value || value.startsWith('enc:v1:')) return value;
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', piiKey, iv);
-  const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
-  return `enc:v1:${Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64url')}`;
-}
-
-const pool = new Pool({ connectionString: url, max: 2 });
-try {
-  const db = drizzle(pool);
-  await migrate(db, { migrationsFolder: './drizzle' });
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const { rows } = await client.query('SELECT id, bank_name, account_name, account_number FROM withdrawals FOR UPDATE');
-    for (const row of rows) {
-      await client.query(
-        'UPDATE withdrawals SET bank_name=$1, account_name=$2, account_number=$3 WHERE id=$4',
-        [encrypt(row.bank_name), encrypt(row.account_name), encrypt(row.account_number), row.id],
-      );
+const root=resolve(fileURLToPath(new URL('../..',import.meta.url)));
+const url=process.env.MIGRATION_DATABASE_URL || process.env.DATABASE_URL;
+if(!url)throw new Error('Migration-owner database URL is required');
+if(process.env.ALLOW_SCHEMA_MIGRATION_APPLY!=='YES'||process.env.FINANCIAL_WORKERS_PAUSED!=='YES')throw new Error('BLOCKED: reviewed schema-migration approval and paused financial traffic/workers are required');
+verifyMigrationFiles();
+const env={...process.env,DATABASE_URL:url,MIGRATION_DATABASE_URL:url};
+const run=(file,args=[])=>execFileSync(process.execPath,[file,...args],{cwd:root,env,encoding:'utf8'});
+console.log(run('scripts/deploy/migration-state-check.mjs').trim());
+const pool=new Pool({connectionString:url,max:1});
+try{
+  const {rows}=await pool.query("SELECT to_regclass('public.withdrawals') AS withdrawals");
+  if(rows[0].withdrawals){
+    const plan=JSON.parse(run('scripts/security/migrate-bank-pii.mjs'));
+    if(plan.plaintextRows){
+      if(process.env.ALLOW_BANK_PII_INITIAL_ENCRYPTION!=='YES')throw new Error('BLOCKED: initial plaintext encryption requires a separately rehearsed/approved BEFORE-0002 plan and original-key/backup preservation');
+      console.log(run('scripts/security/migrate-bank-pii.mjs',['--apply']).trim());
     }
-    await client.query('COMMIT');
-    console.log(JSON.stringify({ bankPiiMigrated: rows.length }));
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined);
-    throw error;
-  } finally { client.release(); }
-  console.log('Database migrations and bank PII protection applied successfully.');
-} finally { await pool.end(); }
+  }
+  await migrate(drizzle(pool),{migrationsFolder:resolve(root,'drizzle')});
+  console.log(run('scripts/deploy/migration-state-check.mjs').trim());
+  console.log('Reviewed schema migrations completed. No withdrawal outcomes/refunds were repaired. NOT a production-readiness or zero-downtime certificate: keep financial traffic paused until preserved-data, constraint, provider and release gates pass.');
+}finally{await pool.end();}

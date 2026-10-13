@@ -1,5 +1,6 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { ApiError } from "@/server/http";
+import { providerUrl } from "@/server/services/provider-url";
 import { providerFetch, runtimeLimits } from "@/server/services/runtime-resilience";
 
 export type CreatePaymentInput = {
@@ -32,7 +33,7 @@ export type VerifyWebhookInput = {
   timestamp?: string;
 };
 
-export type PaymentStatusResult = { provider: string; reference: string; amount: number; status: "PAID" | "FAILED" | "PROCESSING" | "EXPIRED"; providerReference?: string };
+export type PaymentStatusResult = { provider: string; reference: string; amount: number; currency: "IDR"; status: "PAID" | "FAILED" | "PROCESSING" | "EXPIRED"; providerReference?: string };
 
 export interface PaymentProvider {
   readonly name: string;
@@ -91,12 +92,13 @@ export class HttpPaymentProvider implements PaymentProvider {
     const baseUrl = requireEnv("PAYMENT_PROVIDER_BASE_URL");
     const apiKey = requireEnv("PAYMENT_PROVIDER_API_KEY");
     const path = process.env.PAYMENT_PROVIDER_CREATE_PATH?.trim() || "/payments";
-    const url = new URL(path, baseUrl).toString();
+    const url = providerUrl(baseUrl, path, "PAYMENT_PROVIDER_CONFIG_INVALID").toString();
     const response = await providerFetch(this.name, "create", url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, "Idempotency-Key": input.reference },
       body: JSON.stringify({ reference: input.reference, amount: input.amount, currency: input.currency, expiresAt: input.expiresAt.toISOString(), callbackUrl: input.callbackUrl }),
       cache: "no-store",
+      redirect: "error",
       signal: providerSignal(),
     });
     if (!response.ok) throw new ApiError(`Payment provider menolak pembuatan pembayaran (${response.status}).`, "PAYMENT_PROVIDER_CREATE_FAILED", 502);
@@ -109,6 +111,22 @@ export class HttpPaymentProvider implements PaymentProvider {
     if (!providerReference) throw new ApiError("Respons payment provider tidak memiliki reference atau checkout URL.", "PAYMENT_PROVIDER_INVALID_RESPONSE", 502);
     const expiresAt = typeof data.expiresAt === "string" && !Number.isNaN(Date.parse(data.expiresAt)) ? new Date(data.expiresAt) : input.expiresAt;
     return { provider: this.name, providerReference, checkoutUrl, expiresAt };
+  }
+
+  async getPaymentStatus(reference: string): Promise<PaymentStatusResult> {
+    const template = process.env.PAYMENT_PROVIDER_STATUS_PATH?.trim() || "/payments/{reference}";
+    if (!template.includes("{reference}")) throw new ApiError("Payment status path wajib memuat {reference}.", "PAYMENT_PROVIDER_CONFIG_INVALID", 500);
+    const url = providerUrl(requireEnv("PAYMENT_PROVIDER_BASE_URL"), template.replaceAll("{reference}", encodeURIComponent(reference)), "PAYMENT_PROVIDER_CONFIG_INVALID");
+    const response = await providerFetch(this.name, "status", url, { headers: { Authorization: `Bearer ${requireEnv("PAYMENT_PROVIDER_API_KEY")}` }, cache: "no-store", redirect: "error", signal: providerSignal() });
+    if (response.status === 404) return { provider: this.name, reference, amount: 0, currency: "IDR", status: "PROCESSING" };
+    if (!response.ok) throw new ApiError("Status payment provider tidak dapat diperiksa.", "PAYMENT_PROVIDER_STATUS_FAILED", 502);
+    const body: unknown = await response.json().catch(() => null);
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new ApiError("Respons status payment tidak valid.", "PAYMENT_PROVIDER_INVALID_RESPONSE", 502);
+    const data = body as Record<string, unknown>;
+    const status = typeof data.status === "string" ? data.status.trim().toUpperCase() : "";
+    const providerReference = typeof data.providerReference === "string" ? data.providerReference.trim() : "";
+    if (data.reference !== reference || data.currency !== "IDR" || !["PAID", "FAILED", "PROCESSING", "EXPIRED"].includes(status) || !providerReference) throw new ApiError("Identitas/currency/status payment tidak valid.", "PAYMENT_PROVIDER_INVALID_RESPONSE", 502);
+    return { provider: this.name, reference, providerReference, amount: positiveAmount(data.amount), currency: "IDR", status: status as PaymentStatusResult["status"] };
   }
 
   verifyWebhook(input: VerifyWebhookInput): NormalizedWebhookEvent {
@@ -175,11 +193,11 @@ export class MidtransPaymentProvider implements PaymentProvider {
         custom_expiry: { expiry_duration: expiryMinutes, unit: "minute" },
       }),
       cache: "no-store",
+      redirect: "error",
       signal: providerSignal(),
     });
     if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      throw new ApiError(`Midtrans menolak pembuatan pembayaran (${response.status}).${detail ? ` ${detail.slice(0, 240)}` : ""}`, "PAYMENT_PROVIDER_CREATE_FAILED", 502);
+      throw new ApiError(`Midtrans menolak pembuatan pembayaran (${response.status}).`, "PAYMENT_PROVIDER_CREATE_FAILED", 502);
     }
     const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
     const token = typeof payload?.token === "string" ? payload.token.trim() : "";
@@ -193,16 +211,17 @@ export class MidtransPaymentProvider implements PaymentProvider {
     if (!orderId) throw new ApiError("Reference pembayaran tidak valid.", "PAYMENT_PROVIDER_INVALID_REQUEST", 400);
     const authorization = Buffer.from(`${this.serverKey}:`, "utf8").toString("base64");
     const response = await providerFetch(this.name, "status", `${this.baseUrl}/v2/${encodeURIComponent(orderId)}/status`, {
-      method: "GET", headers: { Accept: "application/json", Authorization: `Basic ${authorization}` }, cache: "no-store", signal: providerSignal(),
+      method: "GET", headers: { Accept: "application/json", Authorization: `Basic ${authorization}` }, cache: "no-store", redirect: "error", signal: providerSignal(),
     });
-    if (response.status === 404) return { provider: this.name, reference: orderId, amount: 0, status: "PROCESSING" };
+    if (response.status === 404) return { provider: this.name, reference: orderId, amount: 0, currency: "IDR", status: "PROCESSING" };
     if (!response.ok) throw new ApiError(`Midtrans gagal memeriksa status pembayaran (${response.status}).`, "PAYMENT_PROVIDER_STATUS_FAILED", 502);
     const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+    if (payload?.order_id !== orderId || payload?.currency !== "IDR") throw new ApiError("Order ID atau currency status Midtrans tidak cocok.", "PAYMENT_PROVIDER_INVALID_RESPONSE", 502);
     const amount = positiveAmount(payload?.gross_amount);
     const transactionStatus = typeof payload?.transaction_status === "string" ? payload.transaction_status.toLowerCase() : "";
     const fraudStatus = typeof payload?.fraud_status === "string" ? payload.fraud_status.toLowerCase() : "";
     const status = transactionStatus === "settlement" || (transactionStatus === "capture" && fraudStatus === "accept") ? "PAID" : transactionStatus === "expire" ? "EXPIRED" : ["cancel", "deny", "failure"].includes(transactionStatus) ? "FAILED" : "PROCESSING";
-    return { provider: this.name, reference: orderId, amount, status, providerReference: orderId };
+    return { provider: this.name, reference: orderId, amount, currency: "IDR", status, providerReference: orderId };
   }
 
   verifyWebhook(input: VerifyWebhookInput): NormalizedWebhookEvent {

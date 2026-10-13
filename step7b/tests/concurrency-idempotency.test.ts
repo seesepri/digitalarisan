@@ -1,16 +1,12 @@
-﻿import nextEnv from "@next/env";
-const { loadEnvConfig } = nextEnv;
-import { after, before, describe, test } from "node:test";
+﻿import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 
-loadEnvConfig(process.cwd());
-
-const enabled = Boolean(process.env.TEST_DATABASE_URL || process.env.DATABASE_URL);
-const testDbUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
-
-if (testDbUrl) process.env.DATABASE_URL = testDbUrl;
+const { configureTestDatabase } = await import("../scripts/test-database-guard.mjs");
+const testDbUrl = await configureTestDatabase();
+const enabled = Boolean(testDbUrl);
+if (enabled) process.env.PAYOUT_PROVIDER = "test";
 
 let db: typeof import("@/db").db;
 let pool: typeof import("@/db").pool;
@@ -38,6 +34,10 @@ if (enabled) {
   ({ createWithdrawal } = await import("@/server/services/wallet"));
   ({ processWithdrawal } = await import("@/server/services/payout-withdrawal"));
   ({ approveWithdrawal } = await import("@/server/services/compliance"));
+}
+
+function evidence(id: string, amount: number, status: "SUCCESS" | "FAILED_RETRYABLE") {
+  return { provider: "test", reference: `WD-${createHash("sha256").update(id).digest("hex").slice(0, 32)}`, providerReference: `PROV-${id}`, amount, currency: "IDR" as const, status, failureConfirmed: status === "FAILED_RETRYABLE", checkedAt: new Date().toISOString() };
 }
 
 const maybeDescribe = enabled ? describe : describe.skip;
@@ -219,7 +219,7 @@ maybeDescribe("concurrency + idempotency", () => {
           amount: 10_000,
           bankName: "TEST BANK",
           accountName: "Concurrency Test",
-          accountNumber: `TEST-${index}`,
+          accountNumber: String(1234567890 + index),
           idempotencyKey: `withdraw-${user.userId}-${index}`,
         }),
       ),
@@ -242,7 +242,7 @@ maybeDescribe("concurrency + idempotency", () => {
           amount: 25_000,
           bankName: "TEST BANK",
           accountName: "Concurrency Test",
-          accountNumber: "TEST-ACCOUNT",
+          accountNumber: "1234567890",
           idempotencyKey: key,
         }),
       ),
@@ -262,18 +262,18 @@ maybeDescribe("concurrency + idempotency", () => {
     const checker = await createAdminUser();
     const created = await createWithdrawal({
       userId: user.userId, amount: 25_000, bankName: "TEST BANK", accountName: "Concurrency Test",
-      accountNumber: "TEST-PROCESS", idempotencyKey: `withdraw-process-${randomUUID()}`,
+      accountNumber: "1234567890", idempotencyKey: `withdraw-process-${randomUUID()}`,
     });
     await approveWithdrawal({ withdrawalId: created.withdrawal.id, adminId: maker.userId, reason: "Concurrency test approval" });
     await processWithdrawal({ withdrawalId: created.withdrawal.id, decision: "PROCESSING", adminId: checker.userId, adminRole: "ADMIN" });
     const results = await Promise.allSettled(Array.from({ length: 20 }, () =>
-      processWithdrawal({ withdrawalId: created.withdrawal.id, decision: "SUCCESS", adminId: checker.userId, adminRole: "ADMIN", source: "PROVIDER" }),
+      processWithdrawal({ withdrawalId: created.withdrawal.id, decision: "SUCCESS", adminId: checker.userId, adminRole: "ADMIN", source: "PROVIDER", providerEvidence: evidence(created.withdrawal.id, 25_000, "SUCCESS"), expectedAttemptCount: 1 }),
     ));
     assert.equal(results.filter((r) => r.status === "fulfilled").length, 20);
     const [wallet] = await db.select().from(wallets).where(eq(wallets.id, user.walletId));
     assert.equal(wallet.availableBalance, 75_000);
     assert.equal(wallet.pendingBalance, 0);
-    const txs = await db.select().from(walletTransactions).where(eq(walletTransactions.userId, user.userId));
+    const txs = await db.select().from(walletTransactions).where(eq(walletTransactions.userId, user.userId)).orderBy(walletTransactions.ledgerSequence);
     const withdrawalTxs = txs.filter((tx) => tx.referenceType === "withdrawal" && tx.referenceId === created.withdrawal.id);
     assert.equal(withdrawalTxs.length, 2);
     assert.equal(withdrawalTxs[0].pendingBefore, 0);
@@ -290,7 +290,7 @@ maybeDescribe("concurrency + idempotency", () => {
     const checker = await createAdminUser();
     const created = await createWithdrawal({
       userId: user.userId, amount: 25_000, bankName: "TEST BANK", accountName: "Authority Test",
-      accountNumber: "TEST-AUTH", idempotencyKey: `withdraw-authority-${randomUUID()}`,
+      accountNumber: "1234567890", idempotencyKey: `withdraw-authority-${randomUUID()}`,
     });
     await approveWithdrawal({ withdrawalId: created.withdrawal.id, adminId: maker.userId, reason: "Authority test approval" });
     await processWithdrawal({ withdrawalId: created.withdrawal.id, decision: "PROCESSING", adminId: checker.userId, adminRole: "ADMIN" });
@@ -305,18 +305,18 @@ maybeDescribe("concurrency + idempotency", () => {
     assert.equal(wallet.pendingBalance, 25_000);
   });
 
-  test("retryable withdrawal releases funds on the fifth failed attempt", async () => {
+  test("five explicitly confirmed failed transfers release funds once with consistent final metadata", async () => {
     const user = await createUserWithWallet(100_000);
     const maker = await createAdminUser();
     const checker = await createAdminUser();
     const created = await createWithdrawal({
       userId: user.userId, amount: 25_000, bankName: "TEST BANK", accountName: "Concurrency Test",
-      accountNumber: "TEST-RETRY", idempotencyKey: `withdraw-retry-${randomUUID()}`,
+      accountNumber: "1234567890", idempotencyKey: `withdraw-retry-${randomUUID()}`,
     });
     await approveWithdrawal({ withdrawalId: created.withdrawal.id, adminId: maker.userId, reason: "Retry test approval" });
     for (let attempt = 1; attempt <= 5; attempt += 1) {
       await processWithdrawal({ withdrawalId: created.withdrawal.id, decision: "PROCESSING", adminId: checker.userId, adminRole: "ADMIN" });
-      await processWithdrawal({ withdrawalId: created.withdrawal.id, decision: "FAILED_RETRYABLE", adminId: user.userId, adminRole: "ADMIN", source: "PROVIDER" });
+      await processWithdrawal({ withdrawalId: created.withdrawal.id, decision: "FAILED_RETRYABLE", adminId: user.userId, adminRole: "ADMIN", source: "PROVIDER", providerEvidence: evidence(created.withdrawal.id, 25_000, "FAILED_RETRYABLE"), expectedAttemptCount: attempt });
       if (attempt < 5) {
         await db.update(withdrawals).set({ nextRetryAt: new Date(Date.now() - 1_000) }).where(eq(withdrawals.id, created.withdrawal.id));
       }
@@ -326,6 +326,9 @@ maybeDescribe("concurrency + idempotency", () => {
     assert.equal(withdrawal.status, "FAILED_FINAL");
     assert.equal(wallet.pendingBalance, 0);
     assert.equal(wallet.availableBalance, 100_000);
+    assert.equal(withdrawal.lastErrorCode, "PROVIDER_RETRIES_EXHAUSTED");
+    assert.equal(withdrawal.nextRetryAt, null);
+    assert.doesNotMatch(withdrawal.lastErrorMessage ?? "", /dana tetap ditahan/);
   });
 
   test("two different cancellation keys cannot refund the same participant twice", async () => {

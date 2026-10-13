@@ -7,10 +7,16 @@ function escapeLabel(value: string): string {
 }
 
 function increment(metric: string, labels: Record<string, string>, amount = 1) {
+  labels = Object.fromEntries(Object.entries(labels).map(([name, value]) => [name, value.slice(0, 120)]));
   const key = `${metric}|${Object.entries(labels).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join("|")}`;
   const existing = counters.get(key);
   if (existing) existing.value += amount;
-  else counters.set(key, { key: { metric, labels }, value: amount });
+  else if (counters.size < 2000) counters.set(key, { key: { metric, labels }, value: amount });
+  else {
+    const overflow = counters.get("__series_dropped");
+    if (overflow) overflow.value += amount;
+    else counters.set("__series_dropped", { key: { metric: "digital_arisan_telemetry_series_dropped_total", labels: {} }, value: amount });
+  }
 }
 
 export function normalizeRoute(route: string): string {

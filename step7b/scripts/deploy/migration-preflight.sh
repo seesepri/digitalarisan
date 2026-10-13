@@ -12,4 +12,4 @@ if grep -RniE '^\s*(drop\s+(table|column|schema)|truncate\s+)' drizzle/*.sql; th
   exit 1
 fi
 npm run build
-printf '%s\n' 'Production migration preflight PASS.'
+printf '%s\n' 'Migration file/journal/build preflight PASS. NOT a financial production-readiness or zero-downtime certificate.'

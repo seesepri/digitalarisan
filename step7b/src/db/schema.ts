@@ -2,6 +2,7 @@ import {
   bigint,
   boolean,
   check,
+  customType,
   index,
   integer,
   jsonb,
@@ -72,7 +73,19 @@ export const rateLimitBuckets = pgTable(
   (table) => [index("rate_limit_buckets_expires_idx").on(table.expiresAt), check("rate_limit_buckets_count_valid", sql`${table.count} >= 0`)],
 );
 
-const rupiah = (name: string) => bigint(name, { mode: "number" });
+// Do not silently round PostgreSQL BIGINT into an unsafe IEEE-754 value.
+const rupiah = customType<{ data: number; driverData: string }>({
+  dataType: () => "bigint",
+  fromDriver: (value) => {
+    const amount = Number(value);
+    if (!Number.isSafeInteger(amount) || amount < 0) throw new Error("UNSAFE_MONEY_VALUE: database amount is outside the supported integer range");
+    return amount;
+  },
+  toDriver: (value) => {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error("UNSAFE_MONEY_VALUE: amount is outside the supported integer range");
+    return String(value);
+  },
+});
 
 export const users = pgTable(
   "users",
@@ -102,6 +115,9 @@ export const userSessions = pgTable(
   {
     id: uuid("id").defaultRandom().primaryKey(),
     userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+    familyId: uuid("family_id").notNull().defaultRandom(),
+    revocationReason: varchar("revocation_reason", { length: 32 }),
+    rotatedToSessionId: uuid("rotated_to_session_id").references((): AnyPgColumn => userSessions.id, { onDelete: "set null" }),
     refreshTokenHash: text("refresh_token_hash").notNull(),
     userAgent: text("user_agent"),
     ipAddress: varchar("ip_address", { length: 64 }),
@@ -156,6 +172,7 @@ export const walletTransactions = pgTable(
   "wallet_transactions",
   {
     id: uuid("id").defaultRandom().primaryKey(),
+    ledgerSequence: bigint("ledger_sequence", { mode: "number" }).generatedAlwaysAsIdentity().notNull(),
     walletId: uuid("wallet_id").notNull().references(() => wallets.id, { onDelete: "restrict" }),
     userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
     type: walletTxTypeEnum("type").notNull(),
@@ -177,6 +194,9 @@ export const walletTransactions = pgTable(
   },
   (table) => [
     uniqueIndex("wallet_transactions_idempotency_unique").on(table.idempotencyKey),
+    uniqueIndex("wallet_transactions_reversal_unique").on(table.reversalOfId).where(sql`${table.reversalOfId} IS NOT NULL`),
+    uniqueIndex("wallet_transactions_ledger_sequence_unique").on(table.ledgerSequence),
+    index("wallet_transactions_wallet_sequence_idx").on(table.walletId, table.ledgerSequence),
     index("wallet_transactions_user_created_idx").on(table.userId, table.createdAt, table.id),
     index("wallet_transactions_reference_idx").on(table.referenceType, table.referenceId),
     check("wallet_transactions_amount_positive", sql`${table.amount} > 0`),
@@ -260,11 +280,14 @@ export const withdrawals = pgTable(
     lastErrorCode: varchar("last_error_code", { length: 80 }),
     lastErrorMessage: text("last_error_message"),
     providerReference: varchar("provider_reference", { length: 180 }),
+    provider: varchar("provider", { length: 48 }),
+    lastProviderEvidence: jsonb("last_provider_evidence").$type<import("@/server/services/payout-provider").DisbursementResult>(),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
   (table) => [
     uniqueIndex("withdrawals_idempotency_unique").on(table.idempotencyKey),
+    uniqueIndex("withdrawals_provider_reference_unique").on(table.provider, table.providerReference).where(sql`${table.provider} IS NOT NULL AND ${table.providerReference} IS NOT NULL`),
     index("withdrawals_user_created_idx").on(table.userId, table.createdAt, table.id),
     index("withdrawals_status_retry_idx").on(table.status, table.nextRetryAt),
     check("withdrawals_amount_positive", sql`${table.amount} > 0`),
@@ -438,8 +461,9 @@ export const withdrawalAttempts = pgTable(
     errorCode: varchar("error_code", { length: 80 }),
     errorMessage: text("error_message"),
     providerReference: varchar("provider_reference", { length: 180 }),
+    providerEvidence: jsonb("provider_evidence").$type<import("@/server/services/payout-provider").DisbursementResult>(),
     nextRetryAt: timestamp("next_retry_at", { withTimezone: true, mode: "date" }),
-    createdAt: createdAt(),
+    createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull().default(sql`clock_timestamp()`),
   },
   (table) => [
     uniqueIndex("withdrawal_attempts_idempotency_unique").on(table.idempotencyKey),
@@ -461,7 +485,7 @@ export const payoutAttempts = pgTable(
     errorMessage: text("error_message"),
     providerReference: varchar("provider_reference", { length: 180 }),
     nextRetryAt: timestamp("next_retry_at", { withTimezone: true, mode: "date" }),
-    createdAt: createdAt(),
+    createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull().default(sql`clock_timestamp()`),
   },
   (table) => [
     uniqueIndex("payout_attempts_idempotency_unique").on(table.idempotencyKey),
@@ -492,6 +516,7 @@ export const financialTransactions = pgTable(
   "financial_transactions",
   {
     id: uuid("id").defaultRandom().primaryKey(),
+    ledgerSequence: bigint("ledger_sequence", { mode: "number" }).generatedAlwaysAsIdentity().notNull(),
     accountId: uuid("account_id").notNull().references(() => financialAccounts.id, { onDelete: "restrict" }),
     direction: financialDirectionEnum("direction").notNull(),
     amount: rupiah("amount").notNull(),
@@ -506,6 +531,9 @@ export const financialTransactions = pgTable(
   },
   (table) => [
     uniqueIndex("financial_transactions_idempotency_unique").on(table.idempotencyKey),
+    uniqueIndex("financial_transactions_reversal_unique").on(table.reversalOfId).where(sql`${table.reversalOfId} IS NOT NULL`),
+    uniqueIndex("financial_transactions_ledger_sequence_unique").on(table.ledgerSequence),
+    index("financial_transactions_account_sequence_idx").on(table.accountId, table.ledgerSequence),
     index("financial_transactions_account_created_idx").on(table.accountId, table.createdAt, table.id),
     index("financial_transactions_reference_idx").on(table.referenceType, table.referenceId),
     check("financial_transactions_amount_positive", sql`${table.amount} > 0`),

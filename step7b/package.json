@@ -8,19 +8,19 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test:concurrency": "tsx --tsconfig tsconfig.test.json --test tests/concurrency-idempotency.test.ts",
-    "test:concurrency:watch": "tsx --tsconfig tsconfig.test.json --test --watch tests/concurrency-idempotency.test.mts",
+    "test:concurrency": "node scripts/test-database.mjs tests/concurrency-idempotency.test.ts",
+    "test:concurrency:watch": "tsx --tsconfig tsconfig.test.json --test --watch tests/concurrency-idempotency.test.ts",
     "test:payment-provider": "tsx --test tests/payment-provider.test.ts",
     "test:midtrans": "tsx --test tests/midtrans-payment-provider.test.ts",
     "test:payout-provider": "tsx --test tests/payout-provider.test.ts",
     "test:withdrawal-policy": "tsx --test tests/withdrawal-policy.test.ts",
     "test:job-locking": "tsx --test tests/job-locking.test.ts",
     "test:security": "tsx --test tests/security-hardening.test.ts",
-    "test:integration": "bash scripts/test-integration.sh",
+    "test:integration": "node scripts/test-database.mjs tests/integration-financial.test.ts",
     "test:e2e": "bash scripts/test-e2e.sh",
     "test:load": "node --test tests/load/runtime-resilience.test.mjs",
     "load:stress": "node scripts/runtime/load-stress.mjs",
-    "test:all": "npm run lint && npm run typecheck && npm run test:concurrency && npm run test:payment-provider && npm run test:midtrans && npm run test:payout-provider && npm run test:withdrawal-policy && npm run test:job-locking && npm run test:security && npm run test:observability && npm run test:runtime-resilience && npm run test:integration",
+    "test:all": "npm run lint && npm run typecheck && npm run test:unit && npm run test:database",
     "test:observability": "tsx --test tests/observability.test.ts",
     "backup:postgres": "bash scripts/backup-postgres.sh",
     "verify:backup": "bash scripts/verify-backup.sh",
@@ -53,14 +53,20 @@
     "test:midtrans:sandbox": "MIDTRANS_E2E=1 tsx --test tests/e2e/midtrans-sandbox.test.ts",
     "test:payout:sandbox": "PAYOUT_E2E=1 tsx --test tests/e2e/payout-sandbox.test.ts",
     "load:settlement": "node scripts/runtime/load-settlement.mjs",
-    "test:crash-recovery": "tsx --test tests/crash-restart-recovery.test.ts",
+    "test:crash-recovery": "node scripts/test-database.mjs tests/crash-restart-recovery.test.ts",
     "test:reconciliation-audit": "tsx --test tests/reconciliation-orphan-audit.test.ts",
     "test:provider-reconciliation": "tsx --test tests/reconciliation-orphan-audit.test.ts",
     "test:financial-security-audit": "tsx --test tests/financial-authorization-audit.test.ts",
     "test:privacy": "tsx --test tests/privacy.test.ts",
     "security:migrate-bank-pii": "node scripts/security/migrate-bank-pii.mjs",
     "security:verify-audit": "node scripts/security/verify-audit-integrity.mjs",
-    "compliance:retention-enforce": "bash scripts/compliance-retention-enforce.sh"
+    "compliance:retention-enforce": "bash scripts/compliance-retention-enforce.sh",
+    "test:unit": "node scripts/test-unit.mjs",
+    "test:database": "node scripts/test-database.mjs",
+    "test:financial-integrity": "node scripts/test-database.mjs tests/financial-integrity.integration.test.ts",
+    "test:migrations": "node scripts/migration-rehearsal.mjs",
+    "test:dr": "node scripts/dr-rehearsal.mjs",
+    "test:http:local": "node scripts/test-http-local.mjs"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
@@ -88,5 +94,10 @@
     "tsx": "4.20.6",
     "typescript": "5.9.3"
   },
-  "packageManager": "npm@10.9.2"
+  "packageManager": "npm@10.9.2",
+  "overrides": {
+    "@esbuild-kit/core-utils": {
+      "esbuild": "0.25.12"
+    }
+  }
 }

@@ -3,6 +3,7 @@ const url = process.env.DATABASE_URL;
 if (!url) throw new Error("DATABASE_URL is required");
 const pool = new Pool({ connectionString: url, max: 2 });
 try {
+  await pool.query("SET timezone = 'UTC'");
   const { rows } = await pool.query(`
     WITH chained AS (
       SELECT *, lag(entry_hash) OVER (ORDER BY sequence_no) AS expected_prev

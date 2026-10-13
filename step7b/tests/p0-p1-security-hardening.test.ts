@@ -28,7 +28,7 @@ test("bank-account PII is encrypted and masked", () => {
   const payout = read("src/server/services/payout-withdrawal.ts");
   assert.match(schema, /bankName: text\("bank_name"\)/);
   assert.match(schema, /accountNumber: text\("account_number"\)/);
-  assert.match(wallet, /encryptBankPii\(input\.accountNumber\)/);
+  assert.match(wallet, /encryptBankPii\(input\.accountNumber\.trim\(\)\)/);
   assert.match(wallet, /safeWithdrawalView/);
   assert.match(payout, /decryptBankPii\(w\.accountNumber\)/);
   assert.match(read(".env.production.example"), /BANK_PII_ENCRYPTION_KEY=/);
@@ -36,7 +36,11 @@ test("bank-account PII is encrypted and masked", () => {
 
 test("privacy governance and migration are present", () => {
   assert.ok(existsSync("PRIVACY_DATA_GOVERNANCE_V21.md"));
-  assert.match(read("scripts/deploy/apply-migrations.mjs"), /bankPiiMigrated/);
+  const migration = read("scripts/deploy/apply-migrations.mjs");
+  assert.match(migration, /migrate-bank-pii\.mjs/);
+  assert.match(migration, /ALLOW_BANK_PII_INITIAL_ENCRYPTION/);
+  assert.match(migration, /FINANCIAL_WORKERS_PAUSED/);
+  assert.ok(migration.indexOf("migrate-bank-pii.mjs") < migration.indexOf("await migrate"), "initial encryption must happen before immutable recipient guards");
   assert.match(read(".env.production.example"), /BANK_PII_ENCRYPTION_KEY=/);
 });
 
