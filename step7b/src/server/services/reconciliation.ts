@@ -134,6 +134,46 @@ export async function runAccountingReconciliation(scope: Scope = {}) {
       add({ severity: "CRITICAL", code: "PARENT_TRANSACTION_WITHOUT_LEDGER", entityType: "withdrawal", entityId: String(row.id), expectedValue: { walletLedger: true }, actualValue: { walletLedger: false, status: row.status }, message: "Withdrawal tidak memiliki wallet ledger." });
     }
 
+    const withdrawalMetadataIssues = await tx.execute(sql`
+      SELECT id, status, provider_reference AS "providerReference",
+             last_error_code AS "lastErrorCode", last_error_message AS "lastErrorMessage",
+             next_retry_at AS "nextRetryAt"
+      FROM withdrawals
+      WHERE (status = 'SUCCESS' AND provider_reference IS NULL)
+         OR (status = 'FAILED_FINAL' AND (
+              last_error_code = 'PROVIDER_RETRYABLE_FAILURE'
+              OR last_error_message ILIKE '%dana tetap ditahan untuk retry%'
+            ))
+         OR (status = 'FAILED_RETRYABLE' AND next_retry_at IS NULL)
+    `);
+    for (const row of withdrawalMetadataIssues.rows as Array<Record<string, unknown>>) {
+      const code = row.status === "SUCCESS"
+        ? "WITHDRAWAL_SUCCESS_MISSING_PROVIDER_REFERENCE"
+        : row.status === "FAILED_FINAL"
+          ? "WITHDRAWAL_FINAL_RETRYABLE_METADATA"
+          : "WITHDRAWAL_RETRY_SCHEDULE_MISSING";
+      add({ severity: "CRITICAL", code, entityType: "withdrawal", entityId: String(row.id), expectedValue: { statusMetadataConsistent: true }, actualValue: row, message: "Metadata withdrawal terminal/retry tidak konsisten; status/saldo tidak diubah tanpa verifikasi provider." });
+    }
+
+    const prematureWithdrawalRetries = await tx.execute(sql`
+      SELECT failed.withdrawal_id AS "withdrawalId",
+             retry.attempt_number AS "attemptNumber",
+             retry.created_at AS "retryStartedAt",
+             failed.next_retry_at AS "nextRetryAt"
+      FROM withdrawal_attempts failed
+      INNER JOIN withdrawal_attempts retry
+        ON retry.withdrawal_id = failed.withdrawal_id
+       AND retry.attempt_number = failed.attempt_number + 1
+       AND retry.from_status = 'FAILED_RETRYABLE'
+       AND retry.to_status = 'PROCESSING'
+      WHERE failed.to_status = 'FAILED_RETRYABLE'
+        AND failed.next_retry_at IS NOT NULL
+        AND retry.created_at < failed.next_retry_at
+    `);
+    for (const row of prematureWithdrawalRetries.rows as Array<Record<string, unknown>>) {
+      add({ severity: "CRITICAL", code: "WITHDRAWAL_RETRY_BEFORE_DUE", entityType: "withdrawal", entityId: String(row.withdrawalId), expectedValue: { retryStartedAtOrAfter: row.nextRetryAt }, actualValue: { attemptNumber: row.attemptNumber, retryStartedAt: row.retryStartedAt, nextRetryAt: row.nextRetryAt }, message: "Attempt withdrawal tercatat sebelum next_retry_at; tinjau audit dan bukti provider eksternal." });
+    }
+
     const missingPayoutLedger = await tx.execute(sql`
       SELECT p.id
       FROM payouts p
@@ -520,9 +560,9 @@ export async function runAccountingReconciliation(scope: Scope = {}) {
             decision: "SUCCESS",
             adminRole: "SYSTEM",
             source: "PROVIDER",
-            providerReference: status.providerReference || reference,
+            providerReference: status.providerReference,
           });
-          batchIssues.push({ severity: "CRITICAL", code: "PROVIDER_SUCCESS_DB_PROCESSING", entityType: "withdrawal", entityId: withdrawal.id, expectedValue: { dbStatus: "SUCCESS" }, actualValue: { dbStatus: finalized.status, providerStatus: status.status, providerReference: status.providerReference || reference, recovery: finalized.replayed ? "ALREADY_FINALIZED" : "FINALIZED" }, message: finalized.replayed ? "Provider SUCCESS terdeteksi; withdrawal sudah terlebih dahulu difinalisasi oleh proses lain." : "Provider SUCCESS direkonsiliasi dan withdrawal difinalisasi tepat satu kali." });
+          batchIssues.push({ severity: "CRITICAL", code: "PROVIDER_SUCCESS_DB_PROCESSING", entityType: "withdrawal", entityId: withdrawal.id, expectedValue: { dbStatus: "SUCCESS" }, actualValue: { dbStatus: finalized.status, providerStatus: status.status, providerReference: status.providerReference, recovery: finalized.replayed ? "ALREADY_FINALIZED" : "FINALIZED" }, message: finalized.replayed ? "Provider SUCCESS terdeteksi; withdrawal sudah terlebih dahulu difinalisasi oleh proses lain." : "Provider SUCCESS direkonsiliasi dan withdrawal difinalisasi tepat satu kali." });
         } catch (error) {
           batchIssues.push({ severity: "CRITICAL", code: "PROVIDER_SUCCESS_RECOVERY_FAILED", entityType: "withdrawal", entityId: withdrawal.id, expectedValue: { dbStatus: "SUCCESS", walletDebitCount: 1 }, actualValue: { dbStatus: "PROCESSING", providerStatus: status.status, error: error instanceof Error ? error.message : String(error) }, message: "Provider SUCCESS terdeteksi tetapi finalisasi internal gagal; dana tidak boleh dipotong ulang dan kasus harus diulang/diperiksa." });
         }

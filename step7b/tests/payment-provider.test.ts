@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import test from "node:test";
-import { HttpPaymentProvider } from "@/server/services/payment-provider";
+process.env.DATABASE_URL = "postgresql://127.0.0.1:1/payment_provider_unit_test";
+const { HttpPaymentProvider } = await import("@/server/services/payment-provider");
 
 const secret = "test-secret";
 

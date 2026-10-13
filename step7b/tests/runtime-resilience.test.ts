@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+process.env.DATABASE_URL = "postgresql://127.0.0.1:1/runtime_resilience_unit_test";
 process.env.PROVIDER_CIRCUIT_FAILURE_THRESHOLD = "2";
 process.env.PROVIDER_CIRCUIT_OPEN_MS = "60000";
 process.env.PROVIDER_MAX_CONCURRENCY = "1";

@@ -13,6 +13,10 @@ test("reconciliation audit covers all requested P0 conditions", () => {
     "COMPLETED_PERIOD_RESERVATION_NOT_CONSUMED",
     "DUPLICATE_PROVIDER_REFERENCE",
     "DUPLICATE_IDEMPOTENCY_KEY",
+    "WITHDRAWAL_SUCCESS_MISSING_PROVIDER_REFERENCE",
+    "WITHDRAWAL_FINAL_RETRYABLE_METADATA",
+    "WITHDRAWAL_RETRY_SCHEDULE_MISSING",
+    "WITHDRAWAL_RETRY_BEFORE_DUE",
   ]) {
     assert.match(source, new RegExp(code));
   }
@@ -28,7 +32,7 @@ test("provider SUCCESS reconciliation uses the idempotent provider finalizer", (
   assert.match(reconciliation, /adminRole: "SYSTEM"/);
   assert.match(reconciliation, /replayed \? "ALREADY_FINALIZED" : "FINALIZED"/);
   assert.match(withdrawal, /SELECT id FROM withdrawals WHERE id = \$\{input\.withdrawalId\} FOR UPDATE/);
-  assert.match(withdrawal, /if \(withdrawal\.status === input\.decision\) return \{ id: withdrawal\.id, status: withdrawal\.status, replayed: true/);
+  assert.match(withdrawal, /if \(withdrawal\.status === input\.decision\) \{[\s\S]*replayed: true/);
   assert.match(withdrawal, /referenceType: "withdrawal", referenceId: withdrawal\.id/);
   assert.match(withdrawal, /source === "PROVIDER"/);
 });

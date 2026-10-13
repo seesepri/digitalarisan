@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { retryDelayMs } from "@/server/services/job-lock";
+process.env.DATABASE_URL = "postgresql://127.0.0.1:1/job_lock_unit_test";
+const { retryDelayMs } = await import("@/server/services/job-lock");
 
 test("job retry backoff is bounded and deterministic", () => {
   assert.equal(retryDelayMs(1), 60_000);

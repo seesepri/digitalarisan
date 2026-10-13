@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { MidtransPaymentProvider } from "@/server/services/payment-provider";
+process.env.DATABASE_URL = "postgresql://127.0.0.1:1/midtrans_provider_unit_test";
+const { MidtransPaymentProvider } = await import("@/server/services/payment-provider");
 
 const serverKey = "midtrans-test-server-key";
 process.env.MIDTRANS_IS_PRODUCTION = "false";

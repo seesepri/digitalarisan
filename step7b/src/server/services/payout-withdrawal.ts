@@ -4,6 +4,7 @@ import { auditLogs, notifications, payoutAttempts, payouts, withdrawalAttempts, 
 import { ApiError } from "@/server/http";
 import { getPayoutProvider, stablePayoutReference } from "@/server/services/payout-provider";
 import { decryptBankPii } from "@/server/services/pii";
+import { isWithdrawalRetryDue, resolveWithdrawalFailure } from "@/server/services/withdrawal-policy";
 
 const MAX_WITHDRAWAL_ATTEMPTS = 5;
 const RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000, 60 * 60_000, 6 * 60 * 60_000];
@@ -29,6 +30,19 @@ function retryAt(attempt: number): Date {
   return new Date(Date.now() + RETRY_DELAYS_MS[Math.min(Math.max(attempt - 1, 0), RETRY_DELAYS_MS.length - 1)]);
 }
 
+async function persistWithdrawalProviderReference(input: { withdrawalId: string; attemptCount: number; providerReference: string | null }) {
+  if (!input.providerReference) return;
+  await db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT id FROM withdrawals WHERE id = ${input.withdrawalId} FOR UPDATE`);
+    await tx.update(withdrawals).set({ providerReference: input.providerReference, updatedAt: new Date() }).where(eq(withdrawals.id, input.withdrawalId));
+    await tx.update(withdrawalAttempts).set({ providerReference: input.providerReference }).where(and(
+      eq(withdrawalAttempts.withdrawalId, input.withdrawalId),
+      eq(withdrawalAttempts.attemptNumber, input.attemptCount),
+      eq(withdrawalAttempts.toStatus, "PROCESSING"),
+    ));
+  });
+}
+
 export async function processWithdrawal(input: {
   withdrawalId: string;
   decision: "PROCESSING" | "SUCCESS" | "FAILED_RETRYABLE" | "FAILED_FINAL";
@@ -46,11 +60,21 @@ export async function processWithdrawal(input: {
     // Provider reconciliation may discover the provider reference only after the
     // external status lookup. Persist it under the same row lock as the final
     // state transition so concurrent reconcilers cannot race this metadata.
-    if (input.source === "PROVIDER" && input.providerReference && input.providerReference !== withdrawal.providerReference) {
-      await tx.update(withdrawals).set({ providerReference: input.providerReference, updatedAt: new Date() }).where(eq(withdrawals.id, withdrawal.id));
+    const providerReference = input.source === "PROVIDER" ? input.providerReference?.trim() || null : null;
+    if (providerReference && providerReference !== withdrawal.providerReference) {
+      await tx.update(withdrawals).set({ providerReference, updatedAt: new Date() }).where(eq(withdrawals.id, withdrawal.id));
     }
 
-    if (withdrawal.status === input.decision) return { id: withdrawal.id, status: withdrawal.status, replayed: true, attemptCount: withdrawal.attemptCount };
+    if (withdrawal.status === input.decision) {
+      if (providerReference) {
+        await tx.update(withdrawalAttempts).set({ providerReference }).where(and(
+          eq(withdrawalAttempts.withdrawalId, withdrawal.id),
+          eq(withdrawalAttempts.attemptNumber, withdrawal.attemptCount),
+          eq(withdrawalAttempts.toStatus, withdrawal.status),
+        ));
+      }
+      return { id: withdrawal.id, status: withdrawal.status, replayed: true, attemptCount: withdrawal.attemptCount };
+    }
     if (withdrawal.status === "SUCCESS" || withdrawal.status === "FAILED_FINAL" || withdrawal.status === "CANCELLED") {
       throw new ApiError("Withdrawal sudah berada pada terminal state.", "WITHDRAWAL_TERMINAL", 409);
     }
@@ -66,7 +90,7 @@ export async function processWithdrawal(input: {
       if (withdrawal.status !== "PENDING" && withdrawal.status !== "FAILED_RETRYABLE") {
         throw new ApiError("Withdrawal tidak dapat masuk PROCESSING dari state saat ini.", "INVALID_WITHDRAWAL_TRANSITION", 409);
       }
-      if (withdrawal.status === "FAILED_RETRYABLE" && withdrawal.nextRetryAt && withdrawal.nextRetryAt > now) {
+      if (withdrawal.status === "FAILED_RETRYABLE" && !isWithdrawalRetryDue(withdrawal.nextRetryAt, now)) {
         throw new ApiError("Retry withdrawal belum jatuh tempo.", "WITHDRAWAL_RETRY_NOT_DUE", 409);
       }
       if (withdrawal.attemptCount >= MAX_WITHDRAWAL_ATTEMPTS) {
@@ -95,8 +119,9 @@ export async function processWithdrawal(input: {
     }
     if (!isSuccess && !isRetryable && !terminalFailure) throw new ApiError("State withdrawal tidak valid.", "INVALID_WITHDRAWAL_TRANSITION", 400);
 
-    const nextRetryAt = isRetryable ? (withdrawal.attemptCount >= MAX_WITHDRAWAL_ATTEMPTS ? null : retryAt(withdrawal.attemptCount)) : null;
-    const finalStatus = isRetryable && withdrawal.attemptCount >= MAX_WITHDRAWAL_ATTEMPTS ? "FAILED_FINAL" : input.decision;
+    const outcome = resolveWithdrawalFailure({ decision: input.decision, attemptCount: withdrawal.attemptCount, maxAttempts: MAX_WITHDRAWAL_ATTEMPTS });
+    const finalStatus = outcome.status;
+    const nextRetryAt = finalStatus === "FAILED_RETRYABLE" ? retryAt(withdrawal.attemptCount) : null;
     // PROCESSING reserves funds in pendingBalance. A terminal outcome (SUCCESS or
     // FAILED_FINAL) must consume/release that reservation exactly once.
     const terminalOutcome = isSuccess || finalStatus === "FAILED_FINAL";
@@ -121,13 +146,13 @@ export async function processWithdrawal(input: {
 
     await tx.update(wallets).set({ availableBalance: availableAfter, pendingBalance: pendingAfter, updatedAt: now }).where(eq(wallets.id, wallet.id));
 
-    const errorCode = isRetryable ? "PROVIDER_RETRYABLE_FAILURE" : terminalFailure ? "PROVIDER_FINAL_FAILURE" : null;
-    const errorMessage = isRetryable ? "Provider payout gagal sementara; dana tetap ditahan untuk retry." : terminalFailure ? "Provider payout gagal permanen; dana dikembalikan ke saldo tersedia." : null;
-    await tx.update(withdrawals).set({ status: finalStatus, processedAt: finalStatus === "SUCCESS" || finalStatus === "FAILED_FINAL" ? now : null, nextRetryAt: finalStatus === "FAILED_RETRYABLE" ? nextRetryAt : null, lastErrorCode: errorCode, lastErrorMessage: errorMessage, updatedAt: now }).where(eq(withdrawals.id, withdrawal.id));
+    const errorCode = outcome.errorCode;
+    const errorMessage = outcome.errorMessage;
+    await tx.update(withdrawals).set({ status: finalStatus, processedAt: finalStatus === "SUCCESS" || finalStatus === "FAILED_FINAL" ? now : null, nextRetryAt: finalStatus === "FAILED_RETRYABLE" ? nextRetryAt : null, lastErrorCode: errorCode, lastErrorMessage: errorMessage, ...(providerReference ? { providerReference } : {}), updatedAt: now }).where(eq(withdrawals.id, withdrawal.id));
     await tx.insert(withdrawalAttempts).values({
       withdrawalId: withdrawal.id, attemptNumber: withdrawal.attemptCount, fromStatus: "PROCESSING", toStatus: finalStatus,
       idempotencyKey: `WITHDRAWAL-ATTEMPT-${withdrawal.id}-${withdrawal.attemptCount}-${finalStatus}`,
-      errorCode, errorMessage, nextRetryAt: finalStatus === "FAILED_RETRYABLE" ? nextRetryAt : null,
+      errorCode, errorMessage, providerReference: providerReference ?? withdrawal.providerReference, nextRetryAt: finalStatus === "FAILED_RETRYABLE" ? nextRetryAt : null,
     });
     if (isSuccess || terminalFailure || finalStatus === "FAILED_FINAL") {
       await tx.insert(walletTransactions).values({
@@ -162,7 +187,7 @@ export async function retryPayout(input: { payoutId: string }) {
     const [payout] = await tx.select().from(payouts).where(eq(payouts.id, input.payoutId)).limit(1);
     if (!payout) throw new ApiError("Payout tidak ditemukan.", "PAYOUT_NOT_FOUND", 404);
     if (payout.status !== "FAILED_RETRYABLE") throw new ApiError("Payout tidak berada pada state retryable.", "INVALID_PAYOUT_RETRY", 409);
-    if (payout.nextRetryAt && payout.nextRetryAt > new Date()) throw new ApiError("Retry payout belum jatuh tempo.", "PAYOUT_RETRY_NOT_DUE", 409);
+    if (!isWithdrawalRetryDue(payout.nextRetryAt, new Date())) throw new ApiError("Retry payout belum jatuh tempo.", "PAYOUT_RETRY_NOT_DUE", 409);
     const now = new Date();
     const attemptNumber = payout.attemptCount + 1;
     await tx.update(payouts).set({ status: "PROCESSING", attemptCount: attemptNumber, nextRetryAt: null, updatedAt: now }).where(eq(payouts.id, payout.id));
@@ -184,7 +209,7 @@ export async function executeWithdrawal(input: { withdrawalId: string; adminId: 
     if (withdrawal.riskStatus !== "CLEAR") throw new ApiError("Withdrawal masih berada dalam review risiko.", "WITHDRAWAL_RISK_REVIEW_REQUIRED", 409);
     if (withdrawal.status === "FAILED_FINAL" || withdrawal.status === "CANCELLED") throw new ApiError("Withdrawal sudah berada pada terminal state.", "WITHDRAWAL_TERMINAL", 409);
     const now = new Date();
-    if (withdrawal.status === "FAILED_RETRYABLE" && withdrawal.nextRetryAt && withdrawal.nextRetryAt > now) throw new ApiError("Retry withdrawal belum jatuh tempo.", "WITHDRAWAL_RETRY_NOT_DUE", 409);
+    if (withdrawal.status === "FAILED_RETRYABLE" && !isWithdrawalRetryDue(withdrawal.nextRetryAt, now)) throw new ApiError("Retry withdrawal belum jatuh tempo.", "WITHDRAWAL_RETRY_NOT_DUE", 409);
     if (withdrawal.status === "PENDING" || withdrawal.status === "FAILED_RETRYABLE") {
       if (withdrawal.attemptCount >= MAX_WITHDRAWAL_ATTEMPTS) throw new ApiError("Batas percobaan withdrawal telah tercapai.", "WITHDRAWAL_MAX_ATTEMPTS", 409);
       const attemptNumber=withdrawal.attemptCount+1;
@@ -194,45 +219,48 @@ export async function executeWithdrawal(input: { withdrawalId: string; adminId: 
     }
     return { withdrawal, replayed:false, needsCreate:false };
   });
-  if (started.replayed) return { withdrawal: financialWithdrawalView(started.withdrawal), replayed: true, providerStatus: "SUCCESS" as const };
+  if (started.replayed) return { id: started.withdrawal.id, status: "SUCCESS" as const, withdrawal: financialWithdrawalView(started.withdrawal), replayed: true, providerStatus: "SUCCESS" as const };
   const w=started.withdrawal;
   const reference=stablePayoutReference(w.id);
+  const handleProviderResult = async (result: Awaited<ReturnType<typeof provider.createDisbursement>>) => {
+    if (result.status === "PROCESSING") {
+      await persistWithdrawalProviderReference({ withdrawalId: w.id, attemptCount: w.attemptCount, providerReference: result.providerReference });
+      return { id: w.id, status: "PROCESSING" as const, replayed: false, providerStatus: result.status };
+    }
+    return processWithdrawal({ withdrawalId: w.id, decision: result.status, adminId: input.adminId, adminRole: input.adminRole, meta: input.meta, source: "PROVIDER", providerReference: result.providerReference });
+  };
+  const handleProviderStatus = async (status: Awaited<ReturnType<typeof provider.getDisbursementStatus>>) => {
+    if (status.status === "PROCESSING") {
+      await persistWithdrawalProviderReference({ withdrawalId: w.id, attemptCount: w.attemptCount, providerReference: status.providerReference });
+      return { id: w.id, status: "PROCESSING" as const, replayed: false, providerStatus: status.status };
+    }
+    return processWithdrawal({ withdrawalId: w.id, decision: status.status, adminId: input.adminId, adminRole: input.adminRole, meta: input.meta, source: "PROVIDER", providerReference: status.providerReference });
+  };
   if (!started.needsCreate) {
     const status = await provider.getDisbursementStatus(reference);
-    if (status.status === "SUCCESS") return processWithdrawal({withdrawalId:w.id,decision:"SUCCESS",adminId:input.adminId,adminRole:input.adminRole,meta:input.meta,source:"PROVIDER"});
-    if (status.status === "FAILED_FINAL") return processWithdrawal({withdrawalId:w.id,decision:"FAILED_FINAL",adminId:input.adminId,adminRole:input.adminRole,meta:input.meta,source:"PROVIDER"});
+    if (status.status === "SUCCESS" || status.status === "FAILED_FINAL") return handleProviderStatus(status);
     if (status.status === "FAILED_RETRYABLE") {
       // The provider may return 404/retryable while another executor has not yet
       // completed the idempotent create call. Re-submit with the same reference;
       // the provider idempotency key prevents a duplicate disbursement.
       try {
         const result = await provider.createDisbursement({reference,bankName:decryptBankPii(w.bankName),accountName:decryptBankPii(w.accountName),accountNumber:decryptBankPii(w.accountNumber),amount:w.amount});
-        await db.update(withdrawals).set({providerReference:result.providerReference,updatedAt:new Date()}).where(eq(withdrawals.id,w.id));
-        if(result.status==="SUCCESS") return processWithdrawal({withdrawalId:w.id,decision:"SUCCESS",adminId:input.adminId,adminRole:input.adminRole,meta:input.meta,source:"PROVIDER"});
-        if(result.status==="FAILED_FINAL") return processWithdrawal({withdrawalId:w.id,decision:"FAILED_FINAL",adminId:input.adminId,adminRole:input.adminRole,meta:input.meta,source:"PROVIDER"});
-        if(result.status==="FAILED_RETRYABLE") return processWithdrawal({withdrawalId:w.id,decision:"FAILED_RETRYABLE",adminId:input.adminId,adminRole:input.adminRole,meta:input.meta,source:"PROVIDER"});
-        return { id:w.id, status:"PROCESSING" as const, replayed:false, providerStatus:result.status };
+        return handleProviderResult(result);
       } catch {
         return { id:w.id, status:"PROCESSING" as const, replayed:false, providerStatus:"PROCESSING" as const };
       }
     }
-    return { id:w.id, status:"PROCESSING" as const, replayed:false, providerStatus:status.status };
+    return handleProviderStatus(status);
   }
   try {
     const result=await provider.createDisbursement({reference,bankName:decryptBankPii(w.bankName),accountName:decryptBankPii(w.accountName),accountNumber:decryptBankPii(w.accountNumber),amount:w.amount});
-    await db.update(withdrawals).set({providerReference:result.providerReference,updatedAt:new Date()}).where(eq(withdrawals.id,w.id));
-    if(result.status==="SUCCESS") return processWithdrawal({withdrawalId:w.id,decision:"SUCCESS",adminId:input.adminId,adminRole:input.adminRole,meta:input.meta,source:"PROVIDER"});
-    if(result.status==="FAILED_FINAL") return processWithdrawal({withdrawalId:w.id,decision:"FAILED_FINAL",adminId:input.adminId,adminRole:input.adminRole,meta:input.meta,source:"PROVIDER"});
-    if(result.status==="FAILED_RETRYABLE") return processWithdrawal({withdrawalId:w.id,decision:"FAILED_RETRYABLE",adminId:input.adminId,adminRole:input.adminRole,meta:input.meta,source:"PROVIDER"});
-    return { id:w.id, status:"PROCESSING" as const, replayed:false, providerStatus:result.status };
+    return handleProviderResult(result);
   } catch (error) {
     // A timeout is ambiguous: ask the provider before releasing or retrying funds.
     try {
       const status=await provider.getDisbursementStatus(reference);
-      await db.update(withdrawals).set({providerReference:status.providerReference,updatedAt:new Date()}).where(eq(withdrawals.id,w.id));
-      if(status.status==="SUCCESS") return processWithdrawal({withdrawalId:w.id,decision:"SUCCESS",adminId:input.adminId,adminRole:input.adminRole,meta:input.meta,source:"PROVIDER"});
-      if(status.status==="FAILED_FINAL") return processWithdrawal({withdrawalId:w.id,decision:"FAILED_FINAL",adminId:input.adminId,adminRole:input.adminRole,meta:input.meta,source:"PROVIDER"});
-      if(status.status==="FAILED_RETRYABLE") return processWithdrawal({withdrawalId:w.id,decision:"FAILED_RETRYABLE",adminId:input.adminId,adminRole:input.adminRole,meta:input.meta,source:"PROVIDER"});
+      if(status.status !== "PROCESSING") return handleProviderStatus(status);
+      await persistWithdrawalProviderReference({ withdrawalId: w.id, attemptCount: w.attemptCount, providerReference: status.providerReference });
     } catch { /* retain PROCESSING so an explicit reconciliation can resolve it */ }
     throw error instanceof ApiError ? error : new ApiError("Status payout tidak dapat dipastikan; withdrawal tetap PROCESSING untuk rekonsiliasi.","PAYOUT_AMBIGUOUS",502);
   }
