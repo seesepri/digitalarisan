@@ -1,0 +1,12 @@
+# Add to the PostgreSQL primary configuration (values depend on your hosting provider).
+# WAL archiving is required for point-in-time recovery.
+
+wal_level = replica
+archive_mode = on
+archive_timeout = 60s
+# Use pgBackRest or another managed WAL archive mechanism; do not place secrets here.
+# archive_command = 'pgbackrest --stanza=digital-arisan archive-push %p'
+
+# Keep enough WAL for your operational RPO and backup verification window.
+max_wal_senders = 5
+wal_compression = on

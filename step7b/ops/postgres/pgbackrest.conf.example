@@ -1,0 +1,18 @@
+# Example pgBackRest configuration for PostgreSQL PITR.
+# Store credentials outside source control and use an encrypted object-storage repository.
+
+[global]
+repo1-type=s3
+repo1-path=/digital-arisan-postgres
+repo1-s3-bucket=REPLACE_ME
+repo1-s3-endpoint=REPLACE_ME
+repo1-s3-region=REPLACE_ME
+repo1-retention-full=7
+repo1-retention-diff=14
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=REPLACE_WITH_SECRET_FROM_SECRET_MANAGER
+compress-type=zst
+process-max=4
+
+[digital-arisan]
+pg1-path=/var/lib/postgresql/data
